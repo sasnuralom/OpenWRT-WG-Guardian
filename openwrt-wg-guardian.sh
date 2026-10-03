@@ -1,4 +1,3 @@
-```sh
 #!/bin/sh
 #
 # ============================================================
@@ -1397,4 +1396,3 @@ echo "Recommended: reboot once and watch:"
 echo
 echo "  logread -f -e $LOGTAG"
 echo
-```
