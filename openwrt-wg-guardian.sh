@@ -115,6 +115,94 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
+# ------------------------------------------------------------
+# Standalone system recovery (works even if Guardian is absent)
+# ------------------------------------------------------------
+# Backups are stored outside /etc/wg-guardian so they survive a
+# partial uninstall or a failed Guardian installation.
+RECOVERY_DIR="/root/wg-guardian-backups"
+mkdir -p "$RECOVERY_DIR" 2>/dev/null
+chmod 700 "$RECOVERY_DIR" 2>/dev/null
+
+standalone_restore() {
+    archive="$1"
+    [ -f "$archive" ] || { err 'Backup file not found.'; return 1; }
+    members="$(tar -tzf "$archive" 2>/dev/null)" || { err 'Invalid or unreadable backup archive.'; return 1; }
+    [ -n "$members" ] || { err 'Backup archive is empty.'; return 1; }
+    for member in $members; do
+        case "$member" in
+            etc/config/network|./etc/config/network|etc/config/firewall|./etc/config/firewall|etc/config/dhcp|./etc/config/dhcp|etc/config/system|./etc/config/system|etc/sysctl.conf|./etc/sysctl.conf|etc/wg-guardian/config|./etc/wg-guardian/config) ;;
+            *) err "Refusing unexpected archive path: $member"; return 1 ;;
+        esac
+    done
+    snapshot="$RECOVERY_DIR/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tar -czf "$snapshot" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf 2>/dev/null
+    [ -f "$snapshot" ] && chmod 600 "$snapshot"
+    tmp="$(mktemp -d /tmp/wg-guardian-recovery.XXXXXX 2>/dev/null)" || { err 'Cannot create temporary directory.'; return 1; }
+    if ! tar -xzf "$archive" -C "$tmp" 2>/dev/null; then rm -rf "$tmp"; err 'Could not extract backup.'; return 1; fi
+    for rel in etc/config/network etc/config/firewall etc/config/dhcp etc/config/system etc/sysctl.conf etc/wg-guardian/config; do
+        if [ -f "$tmp/$rel" ]; then
+            mkdir -p "/$(dirname "$rel")"
+            cp -p "$tmp/$rel" "/$rel" || { rm -rf "$tmp"; err "Failed restoring $rel"; return 1; }
+        fi
+    done
+    rm -rf "$tmp"
+    ok 'System settings restored from backup.'
+    [ -f "$snapshot" ] && info "Pre-restore snapshot: $snapshot"
+    warn 'Reboot the router to fully apply restored network settings.'
+}
+
+# Show recovery before detecting WG interface. This lets recovery run
+# even if the Guardian runtime/configuration was never installed.
+set -- "$RECOVERY_DIR"/*.tar.gz "$BASE"/backups/*.tar.gz
+RECOVERY_COUNT=0
+for recovery_archive in "$@"; do [ -f "$recovery_archive" ] && RECOVERY_COUNT=$((RECOVERY_COUNT + 1)); done
+if [ "$RECOVERY_COUNT" -gt 0 ]; then
+    echo
+    echo '=============================================='
+    echo ' Standalone System Recovery'
+    echo '=============================================='
+    echo 'This recovery works even when WG Guardian is not installed.'
+    echo '1) Continue to installer'
+    echo '2) Restore a previous OpenWrt settings backup'
+    echo '3) Exit'
+    while :; do
+        printf 'Choose [1-3, default 1]: '
+        IFS= read -r recovery_action
+        [ -z "$recovery_action" ] && recovery_action=1
+        case "$recovery_action" in
+            1) break ;;
+            2)
+                set -- "$RECOVERY_DIR"/*.tar.gz "$BASE"/backups/*.tar.gz
+                idx=0
+                for recovery_archive in "$@"; do
+                    [ -f "$recovery_archive" ] || continue
+                    idx=$((idx + 1)); printf '  %s) %s
+' "$idx" "$recovery_archive"
+                done
+                while :; do
+                    printf 'Select backup number (1-%s), or 0 to cancel: ' "$idx"
+                    IFS= read -r recovery_pick
+                    [ "$recovery_pick" = 0 ] && break 2
+                    case "$recovery_pick" in ''|*[!0-9]*) echo 'Enter a number.'; continue ;; esac
+                    [ "$recovery_pick" -ge 1 ] && [ "$recovery_pick" -le "$idx" ] || { echo 'Out of range.'; continue; }
+                    n=0; chosen=''
+                    for recovery_archive in "$RECOVERY_DIR"/*.tar.gz "$BASE"/backups/*.tar.gz; do
+                        [ -f "$recovery_archive" ] || continue
+                        n=$((n + 1)); [ "$n" -eq "$recovery_pick" ] && { chosen="$recovery_archive"; break; }
+                    done
+                    printf 'Restore this backup? This replaces matching OpenWrt config files. [y/N]: '
+                    IFS= read -r recovery_confirm
+                    case "$recovery_confirm" in y|Y|yes|YES|Yes) standalone_restore "$chosen" || exit 1; exit 0 ;; *) info 'Restore cancelled.'; break 2 ;; esac
+                done
+                break
+                ;;
+            3) exit 0 ;;
+            *) echo 'Choose 1, 2, or 3.' ;;
+        esac
+    done
+fi
+
 clear 2>/dev/null
 printf '%s\n' '=============================================='
 printf ' %sWireGuard Guardian%s\n' "$CYAN" "$RESET"
@@ -159,6 +247,13 @@ if [ -n "$WAN_IF" ]; then
 else
     warn "WAN interface could not be automatically detected."
     WAN_IF=""
+fi
+
+# ------------------------------------------------------------
+# Existing Guardian configuration notice
+# ------------------------------------------------------------
+if [ -f "$CONFIG" ]; then
+    info 'Existing Guardian configuration detected; standalone recovery is available above.'
 fi
 
 echo
@@ -255,13 +350,17 @@ mkdir -p "$BASE" "$BACKUP_DIR"
 chmod 700 "$BASE" "$BACKUP_DIR"
 
 if [ "$ENABLE_BACKUP" = "1" ]; then
-    FIRST_BACKUP="$BACKUP_DIR/before-install-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar -czf "$FIRST_BACKUP" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf 2>/dev/null
-    if [ -f "$FIRST_BACKUP" ]; then
+    # Keep a copy outside /etc/wg-guardian. It remains available even
+    # if Guardian installation is incomplete or its directory is removed.
+    FIRST_BACKUP="$RECOVERY_DIR/pre-install-$(date +%Y%m%d-%H%M%S).tar.gz"
+    if tar -czf "$FIRST_BACKUP" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf 2>/dev/null && [ -s "$FIRST_BACKUP" ]; then
         chmod 600 "$FIRST_BACKUP"
-        ok 'Pre-install configuration backup created.'
+        cp -p "$FIRST_BACKUP" "$BACKUP_DIR/" 2>/dev/null
+        ok "Pre-install system backup created: $FIRST_BACKUP"
     else
-        warn 'Could not create pre-install backup.'
+        rm -f "$FIRST_BACKUP"
+        warn 'Could not create pre-install backup; no system changes should proceed without a recovery point.'
+        exit 1
     fi
 fi
 
@@ -699,14 +798,50 @@ test_all() {
 }
 
 restore() {
-    latest="$(ls -1t "$BACKUP_DIR"/*.tar.gz 2>/dev/null | head -n 1)"
-    [ -n "$latest" ] || { echo 'No backup available.'; return 1; }
-    echo 'Restoring:'
-    echo "$latest"
-    tar -xzf "$latest" -C / 2>/dev/null || return 1
-    echo
-    echo 'Restore completed.'
-    echo 'Reboot the router to fully apply the restored configuration.'
+    set -- "$BACKUP_DIR"/*.tar.gz
+    count=0
+    for archive in "$@"; do
+        [ -f "$archive" ] || continue
+        count=$((count + 1))
+        printf '  %s) %s\n' "$count" "${archive##*/}"
+    done
+    [ "$count" -gt 0 ] || { echo 'No backup available.'; return 1; }
+    while :; do
+        printf 'Select backup number (1-%s), or 0 to cancel: ' "$count"
+        IFS= read -r choice
+        [ "$choice" = '0' ] && return 0
+        case "$choice" in ''|*[!0-9]*) echo 'Enter a valid number.'; continue ;; esac
+        [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ] || { echo 'Number outside range.'; continue; }
+        idx=0; selected=''
+        for archive in "$BACKUP_DIR"/*.tar.gz; do
+            [ -f "$archive" ] || continue
+            idx=$((idx + 1))
+            [ "$idx" -eq "$choice" ] && { selected="$archive"; break; }
+        done
+        break
+    done
+    printf 'Restore %s? [y/N]: ' "${selected##*/}"
+    IFS= read -r confirm
+    case "$confirm" in y|Y|yes|YES|Yes) ;; *) echo 'Restore cancelled.'; return 0 ;; esac
+    members="$(tar -tzf "$selected" 2>/dev/null)" || { echo 'Invalid backup archive.'; return 1; }
+    for member in $members; do
+        case "$member" in
+            etc/config/network|etc/config/firewall|etc/config/dhcp|etc/config/system|etc/sysctl.conf|etc/wg-guardian/config|./etc/config/network|./etc/config/firewall|./etc/config/dhcp|./etc/config/system|./etc/sysctl.conf|./etc/wg-guardian/config) ;;
+            *) echo "Unexpected archive path: $member"; return 1 ;;
+        esac
+    done
+    mkdir -p "$BACKUP_DIR"
+    before="$BACKUP_DIR/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+    tar -czf "$before" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf "$CONFIG" 2>/dev/null
+    [ -f "$before" ] && chmod 600 "$before"
+    tmp="$(mktemp -d /tmp/wg-guardian-restore.XXXXXX 2>/dev/null)" || return 1
+    tar -xzf "$selected" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+    for rel in etc/config/network etc/config/firewall etc/config/dhcp etc/config/system etc/sysctl.conf etc/wg-guardian/config; do
+        if [ -f "$tmp/$rel" ]; then mkdir -p "/$(dirname "$rel")"; cp -p "$tmp/$rel" "/$rel" || { rm -rf "$tmp"; return 1; }; fi
+    done
+    rm -rf "$tmp"
+    echo 'Restore completed. Reboot the router to apply restored network settings.'
+    [ -f "$before" ] && echo "Pre-restore snapshot: $before"
 }
 
 case "$1" in
@@ -785,6 +920,7 @@ echo "  $RUNTIME status"
 echo "  $RUNTIME test"
 echo "  $RUNTIME backup"
 echo "  $RUNTIME restore"
+echo "Standalone backups: $RECOVERY_DIR"
 echo
 echo 'Live logs:'
 echo "  logread -f -e $LOGTAG"
