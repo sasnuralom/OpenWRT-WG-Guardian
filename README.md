@@ -1,5 +1,7 @@
 # OpenWrt WG Guardian
 
+[**View the installer script**](https://github.com/sasnuralom/OpenWRT-WG-Guardian/blob/main/openwrt-wg-guardian.sh) · [View the repository](https://github.com/sasnuralom/OpenWRT-WG-Guardian) · [Download the latest script](https://raw.githubusercontent.com/sasnuralom/OpenWRT-WG-Guardian/main/openwrt-wg-guardian.sh)
+
 A lightweight WireGuard boot and recovery manager for OpenWrt. WG Guardian is designed to prevent WireGuard from starting before the router has synchronized its system clock, and to monitor the tunnel after startup.
 
 > **Status: testing / use with care**
@@ -42,15 +44,15 @@ For all-LAN full-tunnel operation, your existing OpenWrt configuration must alre
 
 ## Installation
 
-1. Download `openwrt-wg-guardian.sh` from this repository.
-2. Copy it to the router, for example with SCP.
-3. Connect to the router over SSH.
-4. Run:
+You can download the installer directly from the GitHub repository. Connect to the router over SSH and run these commands:
 
 ```sh
-chmod +x openwrt-wg-guardian.sh
-./openwrt-wg-guardian.sh
+wget -O /root/openwrt-wg-guardian.sh https://raw.githubusercontent.com/sasnuralom/OpenWRT-WG-Guardian/main/openwrt-wg-guardian.sh
+chmod +x /root/openwrt-wg-guardian.sh
+/root/openwrt-wg-guardian.sh
 ```
+
+You can also [open the installer source on GitHub](https://github.com/sasnuralom/OpenWRT-WG-Guardian/blob/main/openwrt-wg-guardian.sh) before running it.
 
 The installer detects the first UCI network interface whose protocol is `wireguard`. It also detects the WAN layer-3 device from `network.interface.wan`.
 
@@ -116,6 +118,8 @@ ls -lh /root/wg-guardian-backups/
 Do not extract an archive over a live router unless you understand which files it contains. Prefer restoring configuration from a local console or a planned recovery session.
 
 ## Useful commands
+
+GitHub automatically displays a **Copy** button on the fenced command blocks below.
 
 Check Guardian status:
 
