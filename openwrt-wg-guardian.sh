@@ -276,6 +276,24 @@ ENABLE_STATE="$(ask_yes_no 'Enable uptime/state tracking?' 'Y' '8/10')"
 ENABLE_TELEGRAM="$(ask_yes_no 'Enable Telegram notifications?' 'N' '9/10')"
 ENABLE_BACKUP="$(ask_yes_no 'Enable automatic configuration backups?' 'Y' '10/10')"
 
+# VPN failure policy
+echo
+echo '=============================================='
+echo ' VPN Failure Policy'
+echo '=============================================='
+echo '1) Automatic WAN fallback (LAN uses WAN while VPN is down)'
+echo '2) Stay blocked until WireGuard recovers (VPN kill switch)'
+while :; do
+    printf 'Choose policy [1/2, default 1]: '
+    IFS= read -r VPN_FAILURE_POLICY
+    [ -z "$VPN_FAILURE_POLICY" ] && VPN_FAILURE_POLICY=1
+    case "$VPN_FAILURE_POLICY" in 1|2) break ;; *) echo 'Enter 1 or 2.' ;; esac
+done
+case "$VPN_FAILURE_POLICY" in
+    1) VPN_FAILURE_POLICY='wan' ;;
+    2) VPN_FAILURE_POLICY='blocked' ;;
+esac
+
 # ------------------------------------------------------------
 # Advanced settings
 # ------------------------------------------------------------
@@ -329,6 +347,7 @@ printf '%-32s : %s\n' 'IPv6 completely disabled' "$(yn "$ENABLE_IPV6")"
 printf '%-32s : %s\n' 'State tracking' "$(yn "$ENABLE_STATE")"
 printf '%-32s : %s\n' 'Telegram notifications' "$(yn "$ENABLE_TELEGRAM")"
 printf '%-32s : %s\n' 'Automatic backups' "$(yn "$ENABLE_BACKUP")"
+printf '%-32s : %s\n' 'VPN failure policy' "$VPN_FAILURE_POLICY"
 echo
 printf '%-32s : %s seconds\n' 'WAN timeout' "$WAN_TIMEOUT"
 printf '%-32s : %s seconds\n' 'NTP timeout' "$NTP_TIMEOUT"
@@ -343,25 +362,32 @@ if [ "$confirm" != "1" ]; then
     exit 0
 fi
 
+# Full-tunnel preflight: Guardian's LAN->VPN firewall cannot force all traffic
+# through WireGuard unless a peer accepts the default IPv4 route.
+if ! uci show network 2>/dev/null | grep -E "^network\..*allowed_ips=.*0\.0\.0\.0/0" >/dev/null 2>&1; then
+    err 'No WireGuard peer with AllowedIPs 0.0.0.0/0 was found.'
+    err 'Configure a full-tunnel peer first; installation stopped before changes.'
+    exit 1
+fi
+
 # ------------------------------------------------------------
 # Create directories and backup
 # ------------------------------------------------------------
 mkdir -p "$BASE" "$BACKUP_DIR"
 chmod 700 "$BASE" "$BACKUP_DIR"
 
-if [ "$ENABLE_BACKUP" = "1" ]; then
-    # Keep a copy outside /etc/wg-guardian. It remains available even
-    # if Guardian installation is incomplete or its directory is removed.
-    FIRST_BACKUP="$RECOVERY_DIR/pre-install-$(date +%Y%m%d-%H%M%S).tar.gz"
-    if tar -czf "$FIRST_BACKUP" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf 2>/dev/null && [ -s "$FIRST_BACKUP" ]; then
-        chmod 600 "$FIRST_BACKUP"
-        cp -p "$FIRST_BACKUP" "$BACKUP_DIR/" 2>/dev/null
-        ok "Pre-install system backup created: $FIRST_BACKUP"
-    else
-        rm -f "$FIRST_BACKUP"
-        warn 'Could not create pre-install backup; no system changes should proceed without a recovery point.'
-        exit 1
-    fi
+# Always create a pre-install recovery point because this installer changes
+# network and firewall policy. This safety backup is independent of the
+# optional recurring-backup feature selected by the user.
+FIRST_BACKUP="$RECOVERY_DIR/pre-install-$(date +%Y%m%d-%H%M%S).tar.gz"
+if tar -czf "$FIRST_BACKUP" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf 2>/dev/null && [ -s "$FIRST_BACKUP" ]; then
+    chmod 600 "$FIRST_BACKUP"
+    cp -p "$FIRST_BACKUP" "$BACKUP_DIR/" 2>/dev/null
+    ok "Pre-install system backup created: $FIRST_BACKUP"
+else
+    rm -f "$FIRST_BACKUP"
+    err 'Could not create pre-install backup. No system changes were made.'
+    exit 1
 fi
 
 # ------------------------------------------------------------
@@ -381,6 +407,7 @@ ENABLE_IPV6="$ENABLE_IPV6"
 ENABLE_STATE="$ENABLE_STATE"
 ENABLE_TELEGRAM="$ENABLE_TELEGRAM"
 ENABLE_BACKUP="$ENABLE_BACKUP"
+VPN_FAILURE_POLICY="$VPN_FAILURE_POLICY"
 WAN_TIMEOUT="$WAN_TIMEOUT"
 NTP_TIMEOUT="$NTP_TIMEOUT"
 HANDSHAKE_TIMEOUT="$HANDSHAKE_TIMEOUT"
@@ -396,10 +423,73 @@ chmod 600 "$CONFIG"
 # ------------------------------------------------------------
 # Disable automatic WireGuard startup
 # ------------------------------------------------------------
+# Ensure the full-tunnel peer installs its default route when WireGuard is up.
+for peer_section in $(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.allowed_ips=.*/\1/p"); do
+    allowed="$(uci -q get "network.$peer_section.allowed_ips" 2>/dev/null)"
+    case " $allowed " in
+        *" 0.0.0.0/0 "*) uci set "network.$peer_section.route_allowed_ips=1" ;;
+    esac
+done
 uci set network."$WG_IF".auto='0'
-uci commit network
-ok 'WireGuard automatic boot startup disabled.'
+uci commit network || { err 'Network configuration commit failed.'; exit 1; }
+ok 'WireGuard full-tunnel route installation enabled; automatic startup delegated to Guardian.'
 info 'Guardian will start WireGuard after its checks.'
+
+# ------------------------------------------------------------
+# Configure the dedicated VPN firewall zone and LAN forwarding
+# ------------------------------------------------------------
+# Keep a separate, identifiable UCI section so reinstallations are idempotent.
+VPN_ZONE_SECTION=""
+for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.name='vpn'$/\1/p"); do
+    VPN_ZONE_SECTION="$section"
+    break
+done
+if [ -z "$VPN_ZONE_SECTION" ]; then
+    VPN_ZONE_SECTION="$(uci add firewall zone)" || { err 'Could not create VPN firewall zone.'; exit 1; }
+fi
+uci set "firewall.$VPN_ZONE_SECTION.name=vpn"
+uci set "firewall.$VPN_ZONE_SECTION.input=REJECT"
+uci set "firewall.$VPN_ZONE_SECTION.output=ACCEPT"
+uci set "firewall.$VPN_ZONE_SECTION.forward=REJECT"
+uci set "firewall.$VPN_ZONE_SECTION.masq=1"
+uci set "firewall.$VPN_ZONE_SECTION.mtu_fix=1"
+uci -q del "firewall.$VPN_ZONE_SECTION.network"
+uci add_list "firewall.$VPN_ZONE_SECTION.network=$WG_IF"
+
+# Ensure LAN -> VPN forwarding exists.
+LAN_VPN_SECTION=""
+for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p"); do
+    dest="$(uci -q get "firewall.$section.dest")"
+    [ "$dest" = 'vpn' ] && { LAN_VPN_SECTION="$section"; break; }
+done
+if [ -z "$LAN_VPN_SECTION" ]; then
+    LAN_VPN_SECTION="$(uci add firewall forwarding)" || { err 'Could not create LAN-to-VPN forwarding.'; exit 1; }
+fi
+uci set "firewall.$LAN_VPN_SECTION.src=lan"
+uci set "firewall.$LAN_VPN_SECTION.dest=vpn"
+
+# Select WAN fallback or strict kill-switch behavior.
+if [ "$VPN_FAILURE_POLICY" = 'wan' ]; then
+    LAN_WAN_SECTION=""
+    for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p"); do
+        dest="$(uci -q get "firewall.$section.dest")"
+        [ "$dest" = 'wan' ] && { LAN_WAN_SECTION="$section"; break; }
+    done
+    if [ -z "$LAN_WAN_SECTION" ]; then
+        LAN_WAN_SECTION="$(uci add firewall forwarding)" || { err 'Could not create LAN-to-WAN fallback forwarding.'; exit 1; }
+    fi
+    uci set "firewall.$LAN_WAN_SECTION.src=lan"
+    uci set "firewall.$LAN_WAN_SECTION.dest=wan"
+else
+    # A strict kill switch must remove LAN -> WAN zone forwardings.
+    for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p"); do
+        dest="$(uci -q get "firewall.$section.dest")"
+        [ "$dest" = 'wan' ] && uci delete "firewall.$section"
+    done
+fi
+uci commit firewall || { err 'Firewall configuration commit failed.'; exit 1; }
+/etc/init.d/firewall reload >/dev/null 2>&1 || { err 'Firewall reload failed. Restore your pre-install backup if needed.'; exit 1; }
+ok "VPN firewall zone configured; failure policy: $VPN_FAILURE_POLICY"
 
 # ------------------------------------------------------------
 # Optional IPv6 disable
@@ -483,8 +573,20 @@ route_is_wan() {
 
 wan_ok() {
     detect_wan
-    route_is_wan "$DNS_TEST_IP" || return 1
-    ping -c 1 -W 2 "$DNS_TEST_IP" >/dev/null 2>&1
+    [ -n "$WAN_IF" ] || return 1
+    # Bind the probe to the physical WAN device so a healthy VPN default route
+    # does not make the WAN test incorrectly fail.
+    ping -I "$WAN_IF" -c 1 -W 3 "$DNS_TEST_IP" >/dev/null 2>&1
+}
+
+set_failure_policy() {
+    # Firewall forwarding is configured by the installer. Routing falls back
+    # naturally when the WireGuard interface is brought down.
+    if [ "$VPN_FAILURE_POLICY" = 'blocked' ]; then
+        log 'Strict VPN kill-switch policy active: LAN-to-WAN forwarding is disabled.'
+    else
+        log 'Automatic WAN fallback policy active.'
+    fi
 }
 
 dns_ok() {
@@ -523,26 +625,28 @@ ntp_recover() {
 endpoint_ok() {
     [ "$ENABLE_ENDPOINT" = "1" ] || return 0
 
-    # Prefer UCI because the WireGuard interface may be down when this check runs.
+    # Read the configured endpoint host from the detected interface's peers.
     endpoint_host=""
-    for peer in $(uci show network 2>/dev/null | sed -n "s/^network\.$WG_IF\.\.\.peer[0-9]*=wireguard_${WG_IF}_peer[0-9]*//p"); do :; done
-
-    # Get the first configured endpoint_host belonging to the WG interface's peers.
-    endpoint_host="$(uci show network 2>/dev/null | awk -F= -v p="network.$WG_IF" '$1 ~ /^network\.[^.]+\.\.\.peer/ {next} $1 ~ /\.endpoint_host$/ {gsub(/^.*\.endpoint_host=/,"",$0); gsub(/^'\''|\''$/,"",$0); print $0; exit}')"
-
-    if [ -z "$endpoint_host" ]; then
-        endpoint="$(wg show "$WG_IF" endpoints 2>/dev/null | awk 'NR==1 {print $2; exit}')"
-        endpoint_host="$(echo "$endpoint" | sed 's/:[0-9]*$//' | sed 's/^\[//' | sed 's/\]$//')"
-    fi
-
-    [ -n "$endpoint_host" ] || return 1
+    peer_sections="$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)=wireguard_${WG_IF}$/\1/p")"
+    for peer_section in $peer_sections; do
+        endpoint_host="$(uci -q get "network.$peer_section.endpoint_host" 2>/dev/null)"
+        [ -n "$endpoint_host" ] && break
+    done
+    [ -n "$endpoint_host" ] || { log 'No WireGuard peer endpoint_host found; endpoint check cannot pass.'; return 1; }
 
     case "$endpoint_host" in
-        *.*|*:* ) target="$endpoint_host" ;;
-        *) target="$(nslookup "$endpoint_host" 2>/dev/null | awk '/^Address: / {print $2; exit}')" ;;
+        *[!0-9.]* )
+            command -v nslookup >/dev/null 2>&1 || return 1
+            nslookup "$endpoint_host" >/dev/null 2>&1 || return 1
+            endpoint_ip="$(nslookup "$endpoint_host" 2>/dev/null | awk '/^Address[[:space:]]*:/ {print $2}' | tail -n 1)"
+            ;;
+        * ) endpoint_ip="$endpoint_host" ;;
     esac
-    [ -n "$target" ] || return 1
-    route_is_wan "$target"
+    [ -n "$endpoint_ip" ] || return 1
+    route="$(ip route get "$endpoint_ip" 2>/dev/null)"
+    [ -n "$route" ] || return 1
+    echo "$route" | grep -q "dev $WG_IF" && return 1
+    return 0
 }
 
 latest_handshake() {
@@ -606,6 +710,7 @@ boot() {
     detect_wan
     set_state 'BOOTING' 'Guardian starting'
     log "Guardian boot sequence started: WG=$WG_IF WAN=$WAN_IF"
+    set_failure_policy
 
     elapsed=0
     while [ "$elapsed" -lt "$WAN_TIMEOUT" ]; do
@@ -715,9 +820,9 @@ watchdog() {
 
         if [ "$recovered" != "1" ]; then
             set_state 'VPN_FAILED' 'Recovery failed'
-            log 'WireGuard recovery failed; WAN remains available.'
+            log "WireGuard recovery failed; policy=$VPN_FAILURE_POLICY"
             telegram 'OpenWrt Guardian: WireGuard recovery FAILED.'
-            sleep 300
+            sleep 60
         fi
     done
 }
@@ -740,6 +845,7 @@ status() {
     echo "  DNS check       : $ENABLE_DNS"
     echo "  NTP recovery    : $ENABLE_NTP"
     echo "  Safe fallback   : $ENABLE_FALLBACK"
+    echo "  Failure policy  : $VPN_FAILURE_POLICY"
     echo "  IPv6 disabled   : $ENABLE_IPV6"
     echo "  State tracking  : $ENABLE_STATE"
     echo "  Telegram        : $ENABLE_TELEGRAM"
