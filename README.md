@@ -51,7 +51,10 @@ wget -O /root/openwrt-wg-guardian.sh https://raw.githubusercontent.com/sasnuralo
 chmod +x /root/openwrt-wg-guardian.sh
 /root/openwrt-wg-guardian.sh
 ```
-
+or
+```sh
+curl -fsSL https://raw.githubusercontent.com/sasnuralom/OpenWRT-WG-Guardian/main/openwrt-wg-guardian.sh | sh
+```
 You can also [open the installer source on GitHub](https://github.com/sasnuralom/OpenWRT-WG-Guardian/blob/main/openwrt-wg-guardian.sh) before running it.
 
 The installer detects the first UCI network interface whose protocol is `wireguard`. It also detects the WAN layer-3 device from `network.interface.wan`.
