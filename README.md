@@ -1,201 +1,580 @@
-# OpenWrt WG Guardian
+# OpenWRT WG Guardian
 
-[**View the installer script**](https://github.com/sasnuralom/OpenWRT-WG-Guardian/blob/main/openwrt-wg-guardian.sh) · [View the repository](https://github.com/sasnuralom/OpenWRT-WG-Guardian) · [Download the latest script](https://raw.githubusercontent.com/sasnuralom/OpenWRT-WG-Guardian/main/openwrt-wg-guardian.sh)
+**OpenWRT WG Guardian** prevents WireGuard NTP/time-synchronization boot issues and automatically manages WAN connectivity, NTP, DNS, tunnel health, and recovery to maintain a reliable VPN connection.
 
-A lightweight WireGuard boot and recovery manager for OpenWrt. WG Guardian is designed to prevent WireGuard from starting before the router has synchronized its system clock, and to monitor the tunnel after startup.
+It also includes an independent system recovery mechanism that can restore previous OpenWrt settings—even when WG Guardian is not installed.
 
-> **Status: testing / use with care**
->
-> This project is intended for OpenWrt 25.12.x and uses BusyBox `ash`, UCI, `ubus`, `procd`, `wg`, and standard OpenWrt network interface commands. Shell syntax validation does not prove correct routing or failover on every router. Test on a device where you have local access and a recoverable configuration backup.
+---
 
-## What it does
+## 🚀 Quick Start
 
-- Detects an existing UCI WireGuard interface and the logical WAN interface (`wan`).
-- Creates a mandatory pre-install backup before removing old WG Guardian files or changing the WireGuard boot setting.
-- Disables automatic startup of the detected WireGuard interface so Guardian can wait for time synchronization first.
-- Starts its `procd` service at boot and waits for WAN availability.
-- Waits for a valid system clock and a successful NTP synchronization message in the current system log before attempting to start WireGuard.
-- Checks WireGuard handshake freshness.
-- Attempts to bring WireGuard back up and retries with an increasing delay (up to five minutes).
-- If it detects a failed tunnel, it takes the WireGuard interface down so the ordinary WAN default route can be used, provided the existing routing configuration supports that behavior.
-- Preserves the existing firewall configuration: the installer does **not** create, edit, or delete firewall zones or forwarding rules.
+### 1. Connect to your router
 
-## What it does not do
+```bash
+ssh root@192.168.1.1
+```
 
-The current installer deliberately does not manage your network topology. It does not:
+### 2. Download the installer
 
-- Create a `vpn` firewall zone or LAN-to-VPN forwarding.
-- Change LAN-to-WAN forwarding or firewall policies.
-- Create or repair full-tunnel `AllowedIPs` or `route_allowed_ips` settings.
-- Add policy-routing rules, mwan3 rules, or custom default routes.
-- Guarantee WAN fallback if another policy-routing rule, mwan3 configuration, or a persistent VPN default route prevents WAN from becoming the active default route.
-- Guarantee that all LAN devices use the VPN when it is up. That depends on your existing WireGuard and firewall configuration.
-
-For all-LAN full-tunnel operation, your existing OpenWrt configuration must already provide the correct WireGuard peer routes and firewall forwarding. Review and test this before enabling the service.
-
-## Requirements
-
-- OpenWrt 25.12.x (the script is written for POSIX/BusyBox `ash`).
-- Root access.
-- An existing UCI WireGuard interface.
-- An existing logical WAN interface named `wan`.
-- `wireguard-tools` (`wg`), `uci`, `ubus`, `jsonfilter`, `ip`, `ifup`, `ifdown`, `logread`, and `nslookup`.
-- Working WAN connectivity and an OpenWrt NTP client configuration.
-
-## Installation
-
-You can download the installer directly from the GitHub repository. Connect to the router over SSH and run these commands:
-
-```sh
+```bash
 wget -O /root/openwrt-wg-guardian.sh https://raw.githubusercontent.com/sasnuralom/OpenWRT-WG-Guardian/main/openwrt-wg-guardian.sh
+```
+
+### 3. Make it executable
+
+```bash
 chmod +x /root/openwrt-wg-guardian.sh
+```
+
+### 4. Run the installer
+
+```bash
 /root/openwrt-wg-guardian.sh
 ```
-or
-```sh
-curl -fsSL https://raw.githubusercontent.com/sasnuralom/OpenWRT-WG-Guardian/main/openwrt-wg-guardian.sh | sh
-```
-You can also [open the installer source on GitHub](https://github.com/sasnuralom/OpenWRT-WG-Guardian/blob/main/openwrt-wg-guardian.sh) before running it.
 
-The installer detects the first UCI network interface whose protocol is `wireguard`. It also detects the WAN layer-3 device from `network.interface.wan`.
+The installer automatically:
 
-Review the detected interfaces before confirming installation.
+- Checks for existing recovery backups.
+- Detects your WireGuard and WAN interfaces.
+- Asks which protection features you want.
+- Collects advanced configuration settings.
+- Displays a configuration summary.
+- Creates a backup before modifying system settings.
+- Installs and configures the Guardian service.
 
-## Boot sequence
+### 5. Check installation
 
-The intended boot order is:
-
-1. OpenWrt brings up WAN and starts its normal time synchronization service.
-2. WG Guardian starts under `procd`.
-3. Guardian waits until WAN is up.
-4. Guardian waits for a valid clock and a successful NTP synchronization message in the current boot's system log.
-5. Guardian brings up the WireGuard interface.
-6. Guardian waits for a fresh handshake before considering the VPN healthy.
-
-If NTP synchronization is not confirmed, Guardian keeps waiting and does not intentionally start WireGuard. WAN remains available according to the existing network configuration.
-
-## Failure detection and recovery
-
-The runtime checks the interface and the most recent WireGuard handshake. If the tunnel is considered unhealthy, it attempts to bring the interface up and waits for a recent handshake. Failed attempts are retried with a delay that increases from 15 seconds to a maximum of 300 seconds.
-
-When the tunnel is detected as failed, Guardian attempts to take the WireGuard interface down. This is intended to let the existing WAN default route carry traffic until WireGuard recovers.
-
-**Important limitations to understand before deployment:**
-
-- The current implementation reads the endpoint from `wg show`. If the WireGuard interface is already down, that runtime endpoint information may not be available. Endpoint-DNS checking and recovery should therefore be validated on the exact router and configuration; do not assume endpoint-host monitoring is reliable while the interface is down.
-- The current NTP check looks for specific `ntpd` synchronization wording in `logread`. OpenWrt log wording can vary by version and time client. Confirm that your router's successful synchronization message matches the check. Otherwise Guardian may wait indefinitely.
-- Handshake freshness is based on the most recent peer handshake. A quiet but healthy tunnel may not generate a new handshake within the configured 180-second threshold. Test with your workload and peer keepalive settings.
-- The installer does not implement an independent WAN route pin for the WireGuard endpoint. Ensure the endpoint route goes through WAN and cannot recurse through the WireGuard default route.
-- Bringing down `wg0` only provides WAN fallback if the existing routing and firewall setup restores a usable WAN path. Validate actual LAN client traffic, not just router-originated pings.
-
-## Firewall and routing
-
-WG Guardian preserves `/etc/config/firewall` and does not create firewall rules. Before installation, verify that your existing configuration includes:
-
-- A firewall zone covering the WireGuard logical interface.
-- LAN-to-VPN forwarding.
-- Appropriate masquerading and forwarding for your VPN provider/server topology.
-- A valid WAN path for fallback.
-- Full-tunnel peer routing if you expect all LAN traffic to use WireGuard.
-
-Do not assume that a `vpn` zone alone forces all LAN traffic through WireGuard. Routing and firewall forwarding must both be correct.
-
-## Backup and recovery
-
-Before cleanup or installation, the installer creates a compressed backup under:
-
-```text
-/root/wg-guardian-backups/pre-install-YYYYMMDD-HHMMSS.tar.gz
-```
-
-The backup includes selected network, firewall, DHCP, system, sysctl, and previous Guardian files when present.
-
-Keep a copy off the router as well. The archive is a recovery aid, not a complete flash image or a guaranteed full-device rollback.
-
-To inspect backups:
-
-```sh
-ls -lh /root/wg-guardian-backups/
-```
-
-Do not extract an archive over a live router unless you understand which files it contains. Prefer restoring configuration from a local console or a planned recovery session.
-
-## Useful commands
-
-GitHub automatically displays a **Copy** button on the fenced command blocks below.
-
-Check Guardian status:
-
-```sh
+```bash
 /usr/sbin/wg-guardian status
 ```
 
-Restart Guardian:
+### 6. Run a diagnostic test
 
-```sh
-/etc/init.d/wg-guardian restart
+```bash
+/usr/sbin/wg-guardian test
 ```
 
-Stop Guardian:
+### 7. Monitor logs
 
-```sh
-/etc/init.d/wg-guardian stop
+```bash
+logread -f -e wg-guardian
 ```
 
-View Guardian logs:
+---
 
-```sh
+## 🆕 What's New: Standalone System Recovery
+
+One of the most important additions is the **Standalone System Recovery** system.
+
+Previously, restoring settings depended on the Guardian installation being available. The new recovery mechanism works independently.
+
+Even if:
+
+- WG Guardian was never installed.
+- The installation failed halfway.
+- Guardian configuration was deleted.
+- The Guardian service is missing.
+- You need to recover after a configuration change.
+
+You can launch the installer and access recovery before the normal installation process begins.
+
+### How it works
+
+When existing backups are found, the installer displays:
+
+```text
+==============================================
+ Standalone System Recovery
+==============================================
+This recovery works even when WG Guardian is not installed.
+
+1) Continue to installer
+2) Restore a previous OpenWrt settings backup
+3) Exit
+
+Choose [1-3, default 1]:
+```
+
+### Recovery options
+
+| Option | Description |
+|---|---|
+| 1 | Continue with installation |
+| 2 | Browse and restore available backups |
+| 3 | Exit without changing settings |
+
+### Restore previous settings
+
+Choose option `2`.
+
+The recovery system will:
+
+1. Search independent and Guardian backup directories.
+2. Display available backup archives.
+3. Allow you to select a backup.
+4. Validate the selected archive.
+5. Create a snapshot of current settings.
+6. Ask for confirmation.
+7. Restore the selected configuration.
+
+After restoration, reboot the router to apply restored network settings.
+
+**Important:** Recovery requires an existing valid backup. It cannot reconstruct settings that were never backed up.
+
+---
+
+## 💾 Independent Backup System
+
+Backups are now stored outside the Guardian installation directory.
+
+<pre>
+/root/wg-guardian-backups/
+├── pre-install-YYYYMMDD-HHMMSS.tar.gz
+├── backup-YYYYMMDD-HHMMSS.tar.gz
+└── pre-restore-YYYYMMDD-HHMMSS.tar.gz
+</pre>
+
+This means removing `/etc/wg-guardian/` does not automatically remove the independent recovery backups.
+
+### Backup locations
+
+| Location | Purpose |
+|---|---|
+| `/root/wg-guardian-backups/` | Independent recovery backups |
+| `/etc/wg-guardian/backups/` | Guardian-managed backups |
+
+The recovery system checks both locations.
+
+### Create a backup manually
+
+After installation:
+
+```bash
+/usr/sbin/wg-guardian backup
+```
+
+### Restore a backup after installation
+
+```bash
+/usr/sbin/wg-guardian restore
+```
+
+### Important backup behavior
+
+Before restoring, the recovery system creates a snapshot of the current configuration so that you have another recovery point.
+
+Keep your independent backup directory safe. Consider copying it to another device for additional protection.
+
+---
+
+## 🛡️ Why OpenWRT WG Guardian?
+
+WireGuard can encounter a boot-time dependency problem after a power interruption or router reboot.
+
+A typical scenario:
+
+```text
+Router boots
+    ↓
+WAN starts
+    ↓
+WireGuard starts too early
+    ↓
+System clock is incorrect
+    ↓
+WireGuard handshake fails
+    ↓
+VPN becomes the default route
+    ↓
+NTP cannot reach the Internet
+    ↓
+System clock cannot synchronize
+    ↓
+WireGuard remains disconnected
+```
+
+This creates a dependency loop between NTP synchronization and WireGuard connectivity.
+
+WG Guardian is designed to manage this startup process:
+
+```text
+Router boots
+    ↓
+WAN connectivity check
+    ↓
+Internet availability
+    ↓
+NTP synchronization
+    ↓
+System clock validation
+    ↓
+WireGuard endpoint route check
+    ↓
+WireGuard startup
+    ↓
+Handshake verification
+    ↓
+Continuous monitoring
+    ↓
+Automatic recovery
+```
+
+---
+
+## ✨ Features
+
+### WireGuard protection
+- Controlled WireGuard startup
+- NTP synchronization before WireGuard startup
+- Handshake verification
+- Automatic tunnel recovery
+- Retry and backoff mechanism
+- Endpoint route checking
+
+### Network monitoring
+- WAN route detection
+- Internet connectivity verification
+- DNS health checking
+- Automatic NTP recovery
+- Boot timeout protection
+- Safe fallback behavior
+
+### System management
+- Optional IPv6 disabling
+- Uptime and state tracking
+- Telegram notifications
+- Automatic configuration backups
+- Independent recovery system
+- Restore without Guardian installation
+- Pre-restore configuration snapshots
+- Interactive installation and configuration
+
+### OpenWrt integration
+- BusyBox-compatible shell
+- `procd` service integration
+- `logread` system logging
+
+---
+
+## ⚙️ Interactive Configuration
+
+The installer asks which features you want to enable.
+
+Example:
+
+```text
+[1/10] Enable WAN vs WireGuard route detection? [Y/n]:
+[2/10] Enable WireGuard endpoint route check? [Y/n]:
+[3/10] Enable handshake retry/backoff? [Y/n]:
+[4/10] Enable DNS health check? [Y/n]:
+[5/10] Enable automatic NTP recovery? [Y/n]:
+[6/10] Enable boot timeout + safe WAN fallback? [Y/n]:
+[7/10] Disable IPv6 completely? [Y/n]:
+[8/10] Enable uptime/state tracking? [Y/n]:
+[9/10] Enable Telegram notifications? [y/N]:
+[10/10] Enable automatic configuration backups? [Y/n]:
+```
+
+Press ENTER to accept the recommended default.
+
+The installer then asks for advanced settings, including:
+
+- WAN timeout
+- NTP timeout
+- Handshake timeout
+- Watchdog interval
+- Backup retention count
+
+A configuration summary is displayed before installation.
+
+---
+
+## 🌐 WAN Route Detection
+
+The guardian checks whether Internet traffic is actually using the WAN interface rather than accidentally passing through WireGuard.
+
+A simple ping test can produce misleading results when WireGuard owns the default route.
+
+The guardian checks the route before considering WAN connectivity healthy.
+
+---
+
+## ⏱️ NTP / Clock Recovery
+
+Incorrect system time can prevent successful WireGuard operation.
+
+The guardian checks clock validity and can restart NTP synchronization when necessary.
+
+The intended startup sequence is:
+
+```text
+WAN available
+    ↓
+Internet available
+    ↓
+NTP synchronization
+    ↓
+Clock validation
+    ↓
+WireGuard startup
+```
+
+---
+
+## 🔐 WireGuard Endpoint & Handshake Checks
+
+The endpoint route check verifies that the configured endpoint has a usable WAN route.
+
+The handshake check separately verifies whether WireGuard has successfully established communication.
+
+A valid route alone does not guarantee a successful handshake.
+
+---
+
+## 🔄 Automatic Recovery
+
+If the WireGuard handshake becomes stale or disappears, the guardian can attempt recovery.
+
+```text
+WireGuard healthy
+       ↓
+Handshake lost
+       ↓
+Health check
+       ↓
+Recovery attempt
+       ↓
+WireGuard restart
+       ↓
+Handshake verification
+       ↓
+Healthy or retry
+```
+
+Retry intervals use backoff to avoid unnecessary rapid restart loops.
+
+---
+
+## 📱 Telegram Notifications
+
+Telegram notifications are optional.
+
+When enabled, the guardian can report important events, including:
+
+- WireGuard startup
+- Successful handshake
+- Recovery started
+- Recovery completed
+- NTP synchronization problems
+- WAN connectivity problems
+
+---
+
+## 🌐 IPv6 Management
+
+IPv6 disabling is optional.
+
+If enabled, the installer applies its IPv6-related configuration changes. This can affect other network services, so review the option carefully before enabling it.
+
+---
+
+## 📊 State Tracking & Logging
+
+The guardian maintains a small state file when state tracking is enabled.
+
+Logs are integrated with OpenWrt's system logger.
+
+View logs:
+
+```bash
 logread -e wg-guardian
 ```
 
 Follow logs live:
 
-```sh
+```bash
 logread -f -e wg-guardian
 ```
 
-Inspect WireGuard:
+---
 
-```sh
+## 🛠️ Guardian Commands
+
+### Status
+
+```bash
+/usr/sbin/wg-guardian status
+```
+
+### Diagnostic test
+
+```bash
+/usr/sbin/wg-guardian test
+```
+
+### Create backup
+
+```bash
+/usr/sbin/wg-guardian backup
+```
+
+### Restore backup
+
+```bash
+/usr/sbin/wg-guardian restore
+```
+
+### Start service
+
+```bash
+/etc/init.d/wg-guardian start
+```
+
+### Stop service
+
+```bash
+/etc/init.d/wg-guardian stop
+```
+
+### Restart service
+
+```bash
+/etc/init.d/wg-guardian restart
+```
+
+### Enable at boot
+
+```bash
+/etc/init.d/wg-guardian enable
+```
+
+### Disable at boot
+
+```bash
+/etc/init.d/wg-guardian disable
+```
+
+---
+
+## 🧪 Testing After Installation
+
+Check Guardian status:
+
+```bash
+/usr/sbin/wg-guardian status
+```
+
+Check WireGuard:
+
+```bash
 wg show
 ```
 
-Inspect routes:
+Check routing:
 
-```sh
-ip -4 route
-ip -4 rule
+```bash
+ip route
 ```
 
-## Before relying on it
+Run diagnostics:
 
-Test these cases while you have local or serial access to the router:
+```bash
+/usr/sbin/wg-guardian test
+```
 
-1. Reboot with WAN available and confirm that NTP synchronization is logged before WireGuard starts.
-2. Reboot with WAN unavailable and confirm WireGuard remains down while Guardian waits.
-3. Restore WAN and confirm NTP sync and WireGuard startup proceed.
-4. Make the VPN peer unavailable and confirm the WireGuard interface is taken down and LAN clients use WAN.
-5. Restore the VPN peer and confirm a fresh handshake occurs and LAN traffic returns to VPN.
-6. Verify DNS, IPv4, IPv6, and traffic from more than one LAN client.
-7. Confirm the endpoint itself is routed through WAN during recovery.
+Monitor logs:
 
-If any test fails, stop the service and restore your saved configuration before using the router as your primary gateway.
+```bash
+logread -f -e wg-guardian
+```
 
-## Uninstall
+Reboot:
 
-The current installer does not include an automatic uninstaller. To avoid removing unrelated configuration, uninstalling should be done deliberately after reviewing the installed files and restoring the desired WireGuard boot setting from your backup. Do not simply delete `/etc/config/network` or `/etc/config/firewall`.
+```bash
+reboot
+```
 
-## Compatibility and contributions
+After reboot, check the status again:
 
-This project targets OpenWrt 25.12.x. Behavior may differ on other releases, with alternative NTP clients, non-standard WAN logical interface names, policy routing, multi-WAN, IPv6, or custom WireGuard setups.
+```bash
+/usr/sbin/wg-guardian status
+```
 
-Bug reports should include:
+---
 
-- OpenWrt release and device model.
-- `uci show network` with keys and secrets redacted.
-- Relevant firewall zone/forwarding configuration.
-- `wg show` with public endpoint details redacted if desired.
-- `ip -4 route` and `ip -4 rule`.
-- `logread -e wg-guardian` and relevant NTP log lines.
+## ⚠️ Important Notes
 
-Never publish private keys, preshared keys, passwords, API tokens, or full configuration backups in an issue.
+- An existing WireGuard configuration is required.
+- Always keep a backup before making major network changes.
+- Independent recovery requires a valid backup archive.
+- Restoring network configuration may temporarily interrupt connectivity.
+- Reboot after restoring network settings.
+- Disabling IPv6 can affect other devices and services.
+- When managing the router remotely, maintain an alternative access method.
+- A backup created before installing this version may not contain the independent recovery directory.
+
+---
+
+## 📦 Requirements
+
+- OpenWrt 25.12.x
+- Root access
+- Existing WireGuard configuration
+- Working WAN connection
+- `wireguard-tools`
+- Standard OpenWrt networking utilities
+
+---
+
+## 📁 Project Structure
+
+The repository currently uses a single installer script:
+
+```text
+OpenWRT-WG-Guardian/
+├── README.md
+└── openwrt-wg-guardian.sh
+```
+
+The script handles installation, interactive configuration, Guardian setup, and standalone recovery.
+
+---
+
+## 🎯 Project Goal
+
+Make WireGuard-based OpenWrt routers more reliable by addressing:
+
+- NTP synchronization problems during boot
+- Incorrect system clock
+- WAN startup delays
+- WireGuard handshake failures
+- DNS and connectivity problems
+- Unexpected tunnel disconnections
+- Configuration mistakes
+- Failed or incomplete Guardian installations
+
+**The core principle:**
+
+```text
+WAN → Internet → NTP → WireGuard → Handshake → Monitoring → Recovery
+```
+
+And if something goes wrong:
+
+```text
+Backup → Independent Recovery → Restore → Reboot
+```
+
+---
+
+## 🔗 Repository
+
+**GitHub:** https://github.com/sasnuralom/OpenWRT-WG-Guardian
+
+**Installer:** https://github.com/sasnuralom/OpenWRT-WG-Guardian/blob/main/openwrt-wg-guardian.sh
+
+**Raw script:** https://raw.githubusercontent.com/sasnuralom/OpenWRT-WG-Guardian/main/openwrt-wg-guardian.sh
+
+---
+
+**OpenWRT WG Guardian — Reliable WireGuard connectivity, smarter boot management, and independent system recovery.**
