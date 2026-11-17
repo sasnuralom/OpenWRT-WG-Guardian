@@ -1,1051 +1,240 @@
 #!/bin/sh
-#
-# ============================================================
-# WireGuard Guardian - Interactive Installer
-# OpenWrt 25.12.x
-# ============================================================
-#
-# Usage:
-#   chmod +x openwrt-wg-guardian.sh
-#   ./openwrt-wg-guardian.sh
-#
-# The installer is POSIX / BusyBox sh compatible.
-# ============================================================
+# OpenWrt WG Guardian - clean installer
+# POSIX/BusyBox ash compatible. Does not modify /etc/config/firewall.
 
-APP="wg-guardian"
-BASE="/etc/wg-guardian"
-CONFIG="$BASE/config"
-STATE="$BASE/state"
-BACKUP_DIR="$BASE/backups"
-RUNTIME="/usr/sbin/wg-guardian"
-INIT="/etc/init.d/wg-guardian"
-LOGTAG="wg-guardian"
+set -u
+APP=wg-guardian
+BASE=/etc/wg-guardian
+CONFIG=$BASE/config
+RUNTIME=/usr/sbin/wg-guardian
+INIT=/etc/init.d/wg-guardian
+RECOVERY=/root/wg-guardian-backups
+TAG=wg-guardian
 
-RED="$(printf '\033[31m')"
-GREEN="$(printf '\033[32m')"
-YELLOW="$(printf '\033[33m')"
-CYAN="$(printf '\033[36m')"
-RESET="$(printf '\033[0m')"
-
-msg() { printf '%s\n' "$*"; }
-ok() { printf '%s[OK]%s %s\n' "$GREEN" "$RESET" "$*"; }
-warn() { printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$*"; }
-err() { printf '%s[ERROR]%s %s\n' "$RED" "$RESET" "$*"; }
-info() { printf '%s[INFO]%s %s\n' "$CYAN" "$RESET" "$*"; }
-
-# IMPORTANT: prompts go to stderr because this function is used as
-# command substitution: answer="$(ask_yes_no ...)". Without this,
-# the prompt is captured and is invisible on OpenWrt BusyBox shells.
-ask_yes_no() {
-    question="$1"
-    default="$2"
-    number="$3"
-
-    while :; do
-        if [ "$default" = "Y" ]; then
-            printf '\n[%s] %s [Y/n]: ' "$number" "$question" >&2
-        else
-            printf '\n[%s] %s [y/N]: ' "$number" "$question" >&2
-        fi
-        IFS= read -r answer
-        [ -z "$answer" ] && answer="$default"
-        case "$answer" in
-            y|Y|yes|YES|Yes|yEs|yeS|YEs|YeS|yES)
-                printf '1\n'
-                return 0
-                ;;
-            n|N|no|NO|No|nO|No|NO)
-                printf '0\n'
-                return 0
-                ;;
-            *)
-                printf 'Please enter Y or N.\n' >&2
-                ;;
-        esac
-    done
+say(){ printf '%s\n' "$*"; }
+fail(){ say "ERROR: $*" >&2; exit 1; }
+ask(){ # prompt default; result in REPLY
+  prompt=$1 default=$2
+  while :; do
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+    IFS= read -r REPLY || exit 1
+    [ -n "$REPLY" ] || REPLY=$default
+    case "$REPLY" in *[!A-Za-z0-9_.:-]*|'') say 'Use letters, numbers, underscore, dot, colon or hyphen.' >&2;; *) return 0;; esac
+  done
 }
 
-ask_number() {
-    label="$1"
-    default="$2"
-    min="$3"
-    max="$4"
-    number="$5"
+[ "$(id -u)" = 0 ] || fail 'Run as root.'
+command -v uci >/dev/null 2>&1 || fail 'uci is required (run this on OpenWrt).'
+command -v ubus >/dev/null 2>&1 || fail 'ubus is required.'
+command -v wg >/dev/null 2>&1 || fail 'wireguard-tools (wg) is required.'
 
-    while :; do
-        printf '\n[%s] %s [%s]: ' "$number" "$label" "$default" >&2
-        IFS= read -r value
-        [ -z "$value" ] && value="$default"
+say '================================================='
+say ' OpenWrt WG Guardian - Fresh Installer'
+say ' Existing firewall configuration will NOT be changed.'
+say '================================================='
 
-        case "$value" in
-            ''|*[!0-9]*)
-                printf 'Please enter a whole number.\n' >&2
-                continue
-                ;;
-        esac
+# Detect WG interface
+WG_IF=
+for s in $(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='wireguard'.*/\1/p"); do WG_IF=$s; break; done
+[ -n "$WG_IF" ] || fail 'No UCI WireGuard interface found.'
+WAN_LOGICAL=wan
+WAN_DEV=$(ubus call network.interface.$WAN_LOGICAL status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+[ -n "$WAN_DEV" ] || WAN_DEV=$(ip -4 route show default 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+[ -n "$WAN_DEV" ] || fail 'Could not detect WAN device. Ensure network.interface.wan is up.'
 
-        if [ "$value" -lt "$min" ] 2>/dev/null; then
-            printf 'Value must be at least %s.\n' "$min" >&2
-            continue
-        fi
-        if [ -n "$max" ] && [ "$value" -gt "$max" ] 2>/dev/null; then
-            printf 'Value must be no more than %s.\n' "$max" >&2
-            continue
-        fi
-        printf '%s\n' "$value"
-        return 0
-    done
+say "Detected WireGuard UCI interface: $WG_IF"
+say "Detected WAN device: $WAN_DEV"
+
+# The interface must not race the clock at boot. Guardian owns its startup.
+
+# Validate existing full-tunnel peer configuration; never silently rewrite it.
+if ! uci show network | grep -q "network\.$WG_IF\.\(@wireguard_.*\|[0-9]*\)\.route_allowed_ips='1'"; then
+  say 'WARNING: Could not confirm route_allowed_ips=1 on a WireGuard peer.'
+  say 'For all-LAN full-tunnel routing, at least one peer normally needs AllowedIPs 0.0.0.0/0 and route_allowed_ips 1.'
+  printf 'Continue anyway? [y/N]: ' >&2
+  IFS= read -r yn
+  case "$yn" in y|Y|yes|YES) ;; *) exit 1;; esac
+fi
+
+say ''
+say 'Failure policy: Automatic WAN fallback (only mode in this release).'
+say 'Guardian will bring the WG interface down on detected failure so the normal WAN default route can take over.'
+say 'It will retry the interface in the background and return to VPN after recovery.'
+say ''
+printf 'Install fresh Guardian components? [y/N]: ' >&2
+IFS= read -r yn
+case "$yn" in y|Y|yes|YES) ;; *) say 'Cancelled; no changes made.'; exit 0;; esac
+
+# Independent, mandatory backup before cleanup or config mutation.
+mkdir -p "$RECOVERY" || fail 'Cannot create recovery directory.'
+chmod 700 "$RECOVERY"
+STAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP=$RECOVERY/pre-install-$STAMP.tar.gz
+ tar -czf "$BACKUP" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf "$BASE" /usr/sbin/wg-guardian /etc/init.d/wg-guardian 2>/dev/null || {
+  rm -f "$BACKUP"; fail 'Pre-install backup failed. No cleanup performed.';
 }
+chmod 600 "$BACKUP"
+say "Backup created: $BACKUP"
 
-ask_text() {
-    label="$1"
-    number="$2"
-    printf '\n[%s] %s: ' "$number" "$label" >&2
-    IFS= read -r value
-    printf '%s\n' "$value"
-}
+# Stop and remove only Guardian-owned files/service. Firewall is deliberately untouched.
+if [ -x "$INIT" ]; then "$INIT" stop >/dev/null 2>&1 || true; "$INIT" disable >/dev/null 2>&1 || true; fi
+[ -f /etc/rc.d/S99wg-guardian ] && rm -f /etc/rc.d/S99wg-guardian
+rm -f "$INIT" "$RUNTIME"
+rm -rf "$BASE"
+mkdir -p "$BASE" || fail 'Cannot create Guardian directory.'
+chmod 700 "$BASE"
 
-pause_enter() {
-    printf '\nPress ENTER to continue...' >&2
-    IFS= read -r dummy
-}
-
-if [ "$(id -u)" != "0" ]; then
-    err "This script must be run as root."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Standalone system recovery (works even if Guardian is absent)
-# ------------------------------------------------------------
-# Backups are stored outside /etc/wg-guardian so they survive a
-# partial uninstall or a failed Guardian installation.
-RECOVERY_DIR="/root/wg-guardian-backups"
-mkdir -p "$RECOVERY_DIR" 2>/dev/null
-chmod 700 "$RECOVERY_DIR" 2>/dev/null
-
-standalone_restore() {
-    archive="$1"
-    [ -f "$archive" ] || { err 'Backup file not found.'; return 1; }
-    members="$(tar -tzf "$archive" 2>/dev/null)" || { err 'Invalid or unreadable backup archive.'; return 1; }
-    [ -n "$members" ] || { err 'Backup archive is empty.'; return 1; }
-    for member in $members; do
-        case "$member" in
-            etc/config/network|./etc/config/network|etc/config/firewall|./etc/config/firewall|etc/config/dhcp|./etc/config/dhcp|etc/config/system|./etc/config/system|etc/sysctl.conf|./etc/sysctl.conf|etc/wg-guardian/config|./etc/wg-guardian/config) ;;
-            *) err "Refusing unexpected archive path: $member"; return 1 ;;
-        esac
-    done
-    snapshot="$RECOVERY_DIR/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar -czf "$snapshot" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf 2>/dev/null
-    [ -f "$snapshot" ] && chmod 600 "$snapshot"
-    tmp="$(mktemp -d /tmp/wg-guardian-recovery.XXXXXX 2>/dev/null)" || { err 'Cannot create temporary directory.'; return 1; }
-    if ! tar -xzf "$archive" -C "$tmp" 2>/dev/null; then rm -rf "$tmp"; err 'Could not extract backup.'; return 1; fi
-    for rel in etc/config/network etc/config/firewall etc/config/dhcp etc/config/system etc/sysctl.conf etc/wg-guardian/config; do
-        if [ -f "$tmp/$rel" ]; then
-            mkdir -p "/$(dirname "$rel")"
-            cp -p "$tmp/$rel" "/$rel" || { rm -rf "$tmp"; err "Failed restoring $rel"; return 1; }
-        fi
-    done
-    rm -rf "$tmp"
-    ok 'System settings restored from backup.'
-    [ -f "$snapshot" ] && info "Pre-restore snapshot: $snapshot"
-    warn 'Reboot the router to fully apply restored network settings.'
-}
-
-# Show recovery before detecting WG interface. This lets recovery run
-# even if the Guardian runtime/configuration was never installed.
-set -- "$RECOVERY_DIR"/*.tar.gz "$BASE"/backups/*.tar.gz
-RECOVERY_COUNT=0
-for recovery_archive in "$@"; do [ -f "$recovery_archive" ] && RECOVERY_COUNT=$((RECOVERY_COUNT + 1)); done
-if [ "$RECOVERY_COUNT" -gt 0 ]; then
-    echo
-    echo '=============================================='
-    echo ' Standalone System Recovery'
-    echo '=============================================='
-    echo 'This recovery works even when WG Guardian is not installed.'
-    echo '1) Continue to installer'
-    echo '2) Restore a previous OpenWrt settings backup'
-    echo '3) Exit'
-    while :; do
-        printf 'Choose [1-3, default 1]: '
-        IFS= read -r recovery_action
-        [ -z "$recovery_action" ] && recovery_action=1
-        case "$recovery_action" in
-            1) break ;;
-            2)
-                set -- "$RECOVERY_DIR"/*.tar.gz "$BASE"/backups/*.tar.gz
-                idx=0
-                for recovery_archive in "$@"; do
-                    [ -f "$recovery_archive" ] || continue
-                    idx=$((idx + 1)); printf '  %s) %s
-' "$idx" "$recovery_archive"
-                done
-                while :; do
-                    printf 'Select backup number (1-%s), or 0 to cancel: ' "$idx"
-                    IFS= read -r recovery_pick
-                    [ "$recovery_pick" = 0 ] && break 2
-                    case "$recovery_pick" in ''|*[!0-9]*) echo 'Enter a number.'; continue ;; esac
-                    [ "$recovery_pick" -ge 1 ] && [ "$recovery_pick" -le "$idx" ] || { echo 'Out of range.'; continue; }
-                    n=0; chosen=''
-                    for recovery_archive in "$RECOVERY_DIR"/*.tar.gz "$BASE"/backups/*.tar.gz; do
-                        [ -f "$recovery_archive" ] || continue
-                        n=$((n + 1)); [ "$n" -eq "$recovery_pick" ] && { chosen="$recovery_archive"; break; }
-                    done
-                    printf 'Restore this backup? This replaces matching OpenWrt config files. [y/N]: '
-                    IFS= read -r recovery_confirm
-                    case "$recovery_confirm" in y|Y|yes|YES|Yes) standalone_restore "$chosen" || exit 1; exit 0 ;; *) info 'Restore cancelled.'; break 2 ;; esac
-                done
-                break
-                ;;
-            3) exit 0 ;;
-            *) echo 'Choose 1, 2, or 3.' ;;
-        esac
-    done
-fi
-
-clear 2>/dev/null
-printf '%s\n' '=============================================='
-printf ' %sWireGuard Guardian%s\n' "$CYAN" "$RESET"
-printf ' Interactive Installer for OpenWrt 25.12.x\n'
-printf '%s\n' '=============================================='
-echo
-
-# ------------------------------------------------------------
-# Detect WireGuard interface
-# ------------------------------------------------------------
-WG_IF=""
-for section in $(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.proto='wireguard'.*/\1/p"); do
-    if [ -n "$section" ]; then
-        WG_IF="$section"
-        break
-    fi
-done
-
-if [ -z "$WG_IF" ] && [ "$(uci -q get network.wg0.proto 2>/dev/null)" = "wireguard" ]; then
-    WG_IF="wg0"
-fi
-
-if [ -z "$WG_IF" ]; then
-    err "No WireGuard interface was detected."
-    echo
-    echo "Check with:"
-    echo "  uci show network | grep wireguard"
-    exit 1
-fi
-ok "WireGuard interface detected: $WG_IF"
-
-# ------------------------------------------------------------
-# Detect WAN interface
-# ------------------------------------------------------------
-WAN_IF="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
-if [ -z "$WAN_IF" ]; then
-    WAN_IF="$(ip route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
-fi
-
-if [ -n "$WAN_IF" ]; then
-    ok "WAN interface detected: $WAN_IF"
-else
-    warn "WAN interface could not be automatically detected."
-    WAN_IF=""
-fi
-
-# ------------------------------------------------------------
-# Existing Guardian configuration notice
-# ------------------------------------------------------------
-if [ -f "$CONFIG" ]; then
-    info 'Existing Guardian configuration detected; standalone recovery is available above.'
-fi
-
-echo
-echo 'The installer will now ask which features you want.'
-echo 'Every question is numbered and remains visible.'
-echo 'Press ENTER to accept the recommended default.'
-echo
-
-# ------------------------------------------------------------
-# Feature configuration
-# ------------------------------------------------------------
-ENABLE_ROUTE="$(ask_yes_no 'Enable WAN vs WireGuard route detection?' 'Y' '1/10')"
-ENABLE_ENDPOINT="$(ask_yes_no 'Enable WireGuard endpoint route check?' 'Y' '2/10')"
-ENABLE_RETRY="$(ask_yes_no 'Enable handshake retry/backoff?' 'Y' '3/10')"
-ENABLE_DNS="$(ask_yes_no 'Enable DNS health check?' 'Y' '4/10')"
-ENABLE_NTP="$(ask_yes_no 'Enable automatic NTP recovery?' 'Y' '5/10')"
-ENABLE_FALLBACK="$(ask_yes_no 'Enable boot timeout + safe WAN fallback?' 'Y' '6/10')"
-ENABLE_IPV6="$(ask_yes_no 'Disable IPv6 completely?' 'Y' '7/10')"
-ENABLE_STATE="$(ask_yes_no 'Enable uptime/state tracking?' 'Y' '8/10')"
-ENABLE_TELEGRAM="$(ask_yes_no 'Enable Telegram notifications?' 'N' '9/10')"
-ENABLE_BACKUP="$(ask_yes_no 'Enable automatic configuration backups?' 'Y' '10/10')"
-
-# VPN failure policy
-echo
-echo '=============================================='
-echo ' VPN Failure Policy'
-echo '=============================================='
-echo '1) Automatic WAN fallback (LAN uses WAN while VPN is down)'
-echo '2) Stay blocked until WireGuard recovers (VPN kill switch)'
-while :; do
-    printf 'Choose policy [1/2, default 1]: '
-    IFS= read -r VPN_FAILURE_POLICY
-    [ -z "$VPN_FAILURE_POLICY" ] && VPN_FAILURE_POLICY=1
-    case "$VPN_FAILURE_POLICY" in 1|2) break ;; *) echo 'Enter 1 or 2.' ;; esac
-done
-case "$VPN_FAILURE_POLICY" in
-    1) VPN_FAILURE_POLICY='wan' ;;
-    2) VPN_FAILURE_POLICY='blocked' ;;
-esac
-
-# ------------------------------------------------------------
-# Advanced settings
-# ------------------------------------------------------------
-echo
-echo '=============================================='
-echo ' Advanced Settings'
-echo '=============================================='
-
-echo 'Use ENTER for the recommended value.'
-WAN_TIMEOUT="$(ask_number 'WAN timeout in seconds' '120' '10' '3600' '1/5')"
-NTP_TIMEOUT="$(ask_number 'NTP timeout in seconds' '120' '10' '3600' '2/5')"
-HANDSHAKE_TIMEOUT="$(ask_number 'Handshake timeout in seconds' '180' '5' '3600' '3/5')"
-WATCHDOG_INTERVAL="$(ask_number 'Watchdog check interval in seconds' '60' '10' '3600' '4/5')"
-BACKUP_RETENTION="$(ask_number 'Backup retention count' '5' '1' '100' '5/5')"
-
-TELEGRAM_TOKEN=""
-TELEGRAM_CHAT=""
-if [ "$ENABLE_TELEGRAM" = "1" ]; then
-    echo
-echo '=============================================='
-    echo ' Telegram Configuration'
-    echo '=============================================='
-    TELEGRAM_TOKEN="$(ask_text 'Telegram Bot Token' '1/2')"
-    TELEGRAM_CHAT="$(ask_text 'Telegram Chat ID' '2/2')"
-    if [ -z "$TELEGRAM_TOKEN" ] || [ -z "$TELEGRAM_CHAT" ]; then
-        warn 'Telegram information incomplete. Telegram will be disabled.'
-        ENABLE_TELEGRAM="0"
-    fi
-fi
-
-# ------------------------------------------------------------
-# Summary
-# ------------------------------------------------------------
-yn() { [ "$1" = "1" ] && printf 'YES' || printf 'NO'; }
-
-echo
-echo '=============================================='
-echo ' Configuration Summary'
-echo '=============================================='
-echo
-printf '%-32s : %s\n' 'WireGuard interface' "$WG_IF"
-printf '%-32s : %s\n' 'WAN interface' "${WAN_IF:-AUTO}"
-echo
-printf '%-32s : %s\n' 'WAN/WG route detection' "$(yn "$ENABLE_ROUTE")"
-printf '%-32s : %s\n' 'Endpoint route check' "$(yn "$ENABLE_ENDPOINT")"
-printf '%-32s : %s\n' 'Handshake retry/backoff' "$(yn "$ENABLE_RETRY")"
-printf '%-32s : %s\n' 'DNS health check' "$(yn "$ENABLE_DNS")"
-printf '%-32s : %s\n' 'Automatic NTP recovery' "$(yn "$ENABLE_NTP")"
-printf '%-32s : %s\n' 'Boot timeout/fallback' "$(yn "$ENABLE_FALLBACK")"
-printf '%-32s : %s\n' 'IPv6 completely disabled' "$(yn "$ENABLE_IPV6")"
-printf '%-32s : %s\n' 'State tracking' "$(yn "$ENABLE_STATE")"
-printf '%-32s : %s\n' 'Telegram notifications' "$(yn "$ENABLE_TELEGRAM")"
-printf '%-32s : %s\n' 'Automatic backups' "$(yn "$ENABLE_BACKUP")"
-printf '%-32s : %s\n' 'VPN failure policy' "$VPN_FAILURE_POLICY"
-echo
-printf '%-32s : %s seconds\n' 'WAN timeout' "$WAN_TIMEOUT"
-printf '%-32s : %s seconds\n' 'NTP timeout' "$NTP_TIMEOUT"
-printf '%-32s : %s seconds\n' 'Handshake timeout' "$HANDSHAKE_TIMEOUT"
-printf '%-32s : %s seconds\n' 'Watchdog interval' "$WATCHDOG_INTERVAL"
-printf '%-32s : %s\n' 'Backup retention' "$BACKUP_RETENTION"
-echo
-
-confirm="$(ask_yes_no 'Proceed with installation?' 'Y' 'CONFIRM')"
-if [ "$confirm" != "1" ]; then
-    warn 'Installation cancelled. No changes were made.'
-    exit 0
-fi
-
-# Full-tunnel preflight: Guardian's LAN->VPN firewall cannot force all traffic
-# through WireGuard unless a peer accepts the default IPv4 route.
-if ! uci show network 2>/dev/null | grep -E "^network\..*allowed_ips=.*0\.0\.0\.0/0" >/dev/null 2>&1; then
-    err 'No WireGuard peer with AllowedIPs 0.0.0.0/0 was found.'
-    err 'Configure a full-tunnel peer first; installation stopped before changes.'
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Create directories and backup
-# ------------------------------------------------------------
-mkdir -p "$BASE" "$BACKUP_DIR"
-chmod 700 "$BASE" "$BACKUP_DIR"
-
-# Always create a pre-install recovery point because this installer changes
-# network and firewall policy. This safety backup is independent of the
-# optional recurring-backup feature selected by the user.
-FIRST_BACKUP="$RECOVERY_DIR/pre-install-$(date +%Y%m%d-%H%M%S).tar.gz"
-if tar -czf "$FIRST_BACKUP" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf 2>/dev/null && [ -s "$FIRST_BACKUP" ]; then
-    chmod 600 "$FIRST_BACKUP"
-    cp -p "$FIRST_BACKUP" "$BACKUP_DIR/" 2>/dev/null
-    ok "Pre-install system backup created: $FIRST_BACKUP"
-else
-    rm -f "$FIRST_BACKUP"
-    err 'Could not create pre-install backup. No system changes were made.'
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Save configuration
-# ------------------------------------------------------------
-cat > "$CONFIG" <<EOF_CONFIG
-# WireGuard Guardian Configuration
-WG_IF="$WG_IF"
-WAN_IF="$WAN_IF"
-ENABLE_ROUTE="$ENABLE_ROUTE"
-ENABLE_ENDPOINT="$ENABLE_ENDPOINT"
-ENABLE_RETRY="$ENABLE_RETRY"
-ENABLE_DNS="$ENABLE_DNS"
-ENABLE_NTP="$ENABLE_NTP"
-ENABLE_FALLBACK="$ENABLE_FALLBACK"
-ENABLE_IPV6="$ENABLE_IPV6"
-ENABLE_STATE="$ENABLE_STATE"
-ENABLE_TELEGRAM="$ENABLE_TELEGRAM"
-ENABLE_BACKUP="$ENABLE_BACKUP"
-VPN_FAILURE_POLICY="$VPN_FAILURE_POLICY"
-WAN_TIMEOUT="$WAN_TIMEOUT"
-NTP_TIMEOUT="$NTP_TIMEOUT"
-HANDSHAKE_TIMEOUT="$HANDSHAKE_TIMEOUT"
-WATCHDOG_INTERVAL="$WATCHDOG_INTERVAL"
-BACKUP_RETENTION="$BACKUP_RETENTION"
-TELEGRAM_TOKEN="$TELEGRAM_TOKEN"
-TELEGRAM_CHAT="$TELEGRAM_CHAT"
-DNS_TEST_DOMAIN="openwrt.org"
-DNS_TEST_IP="1.1.1.1"
-EOF_CONFIG
+cat > "$CONFIG" <<EOF_CFG
+WG_IF='$WG_IF'
+WAN_LOGICAL='$WAN_LOGICAL'
+WAN_DEV='$WAN_DEV'
+CHECK_INTERVAL=30
+RETRY_INITIAL=15
+RETRY_MAX=300
+HANDSHAKE_STALE=180
+NTP_WAIT_INTERVAL=10
+NTP_VALID_EPOCH=1704067200
+EOF_CFG
 chmod 600 "$CONFIG"
 
-# ------------------------------------------------------------
-# Disable automatic WireGuard startup
-# ------------------------------------------------------------
-# Ensure the full-tunnel peer installs its default route when WireGuard is up.
-for peer_section in $(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)\.allowed_ips=.*/\1/p"); do
-    allowed="$(uci -q get "network.$peer_section.allowed_ips" 2>/dev/null)"
-    case " $allowed " in
-        *" 0.0.0.0/0 "*) uci set "network.$peer_section.route_allowed_ips=1" ;;
-    esac
-done
-uci set network."$WG_IF".auto='0'
-uci commit network || { err 'Network configuration commit failed.'; exit 1; }
-ok 'WireGuard full-tunnel route installation enabled; automatic startup delegated to Guardian.'
-info 'Guardian will start WireGuard after its checks.'
+# Disable automatic WG startup so it cannot start before time synchronization.
+uci set network."$WG_IF".auto='0' || fail 'Could not disable automatic WireGuard startup.'
+uci commit network || fail 'Could not commit WireGuard boot setting.'
+say 'WireGuard automatic boot startup disabled; Guardian will start it after NTP sync.'
 
-# ------------------------------------------------------------
-# Configure the dedicated VPN firewall zone and LAN forwarding
-# ------------------------------------------------------------
-# Keep a separate, identifiable UCI section so reinstallations are idempotent.
-VPN_ZONE_SECTION=""
-for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.name='vpn'$/\1/p"); do
-    VPN_ZONE_SECTION="$section"
-    break
-done
-if [ -z "$VPN_ZONE_SECTION" ]; then
-    VPN_ZONE_SECTION="$(uci add firewall zone)" || { err 'Could not create VPN firewall zone.'; exit 1; }
-fi
-uci set "firewall.$VPN_ZONE_SECTION.name=vpn"
-uci set "firewall.$VPN_ZONE_SECTION.input=REJECT"
-uci set "firewall.$VPN_ZONE_SECTION.output=ACCEPT"
-uci set "firewall.$VPN_ZONE_SECTION.forward=REJECT"
-uci set "firewall.$VPN_ZONE_SECTION.masq=1"
-uci set "firewall.$VPN_ZONE_SECTION.mtu_fix=1"
-uci -q del "firewall.$VPN_ZONE_SECTION.network"
-uci add_list "firewall.$VPN_ZONE_SECTION.network=$WG_IF"
-
-# Ensure LAN -> VPN forwarding exists.
-LAN_VPN_SECTION=""
-for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p"); do
-    dest="$(uci -q get "firewall.$section.dest")"
-    [ "$dest" = 'vpn' ] && { LAN_VPN_SECTION="$section"; break; }
-done
-if [ -z "$LAN_VPN_SECTION" ]; then
-    LAN_VPN_SECTION="$(uci add firewall forwarding)" || { err 'Could not create LAN-to-VPN forwarding.'; exit 1; }
-fi
-uci set "firewall.$LAN_VPN_SECTION.src=lan"
-uci set "firewall.$LAN_VPN_SECTION.dest=vpn"
-
-# Select WAN fallback or strict kill-switch behavior.
-if [ "$VPN_FAILURE_POLICY" = 'wan' ]; then
-    LAN_WAN_SECTION=""
-    for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p"); do
-        dest="$(uci -q get "firewall.$section.dest")"
-        [ "$dest" = 'wan' ] && { LAN_WAN_SECTION="$section"; break; }
-    done
-    if [ -z "$LAN_WAN_SECTION" ]; then
-        LAN_WAN_SECTION="$(uci add firewall forwarding)" || { err 'Could not create LAN-to-WAN fallback forwarding.'; exit 1; }
-    fi
-    uci set "firewall.$LAN_WAN_SECTION.src=lan"
-    uci set "firewall.$LAN_WAN_SECTION.dest=wan"
-else
-    # A strict kill switch must remove LAN -> WAN zone forwardings.
-    for section in $(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.src='lan'$/\1/p"); do
-        dest="$(uci -q get "firewall.$section.dest")"
-        [ "$dest" = 'wan' ] && uci delete "firewall.$section"
-    done
-fi
-uci commit firewall || { err 'Firewall configuration commit failed.'; exit 1; }
-/etc/init.d/firewall reload >/dev/null 2>&1 || { err 'Firewall reload failed. Restore your pre-install backup if needed.'; exit 1; }
-ok "VPN firewall zone configured; failure policy: $VPN_FAILURE_POLICY"
-
-# ------------------------------------------------------------
-# Optional IPv6 disable
-# ------------------------------------------------------------
-if [ "$ENABLE_IPV6" = "1" ]; then
-    info 'Disabling IPv6...'
-    for file in /proc/sys/net/ipv6/conf/all/disable_ipv6 /proc/sys/net/ipv6/conf/default/disable_ipv6 /proc/sys/net/ipv6/conf/lo/disable_ipv6; do
-        [ -f "$file" ] && echo 1 > "$file" 2>/dev/null
-    done
-    touch /etc/sysctl.conf
-    sed -i '/# WG-GUARDIAN-IPV6-START/,/# WG-GUARDIAN-IPV6-END/d' /etc/sysctl.conf
-    cat >> /etc/sysctl.conf <<'EOF_IPV6'
-# WG-GUARDIAN-IPV6-START
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-net.ipv6.conf.lo.disable_ipv6=1
-# WG-GUARDIAN-IPV6-END
-EOF_IPV6
-    command -v sysctl >/dev/null 2>&1 && sysctl -p /etc/sysctl.conf >/dev/null 2>&1
-    uci set network.lan.ip6assign='0' 2>/dev/null
-    uci -q get network.wan6 >/dev/null 2>&1 && uci set network.wan6.disabled='1'
-    uci set dhcp.lan.ra='disabled' 2>/dev/null
-    uci set dhcp.lan.dhcpv6='disabled' 2>/dev/null
-    uci set dhcp.lan.ndp='disabled' 2>/dev/null
-    uci commit network
-    uci commit dhcp 2>/dev/null
-    ok 'IPv6 disabled.'
-else
-    info 'IPv6 was left unchanged.'
-fi
-
-# ------------------------------------------------------------
-# Generate runtime guardian
-# ------------------------------------------------------------
-cat > "$RUNTIME" <<'EOF_RUNTIME'
+cat > "$RUNTIME" <<'EOF_RUN'
 #!/bin/sh
-
-APP="wg-guardian"
-BASE="/etc/wg-guardian"
-CONFIG="$BASE/config"
-STATE="$BASE/state"
-BACKUP_DIR="$BASE/backups"
-LOGTAG="wg-guardian"
-
-[ -f "$CONFIG" ] || exit 1
+set -u
+CONFIG=/etc/wg-guardian/config
+[ -r "$CONFIG" ] || exit 1
 . "$CONFIG"
-
-log() { logger -t "$LOGTAG" "$*"; }
-timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
-
-set_state() {
-    [ "$ENABLE_STATE" = "1" ] || return 0
-    cat > "$STATE" <<EOF_STATE
-STATE="$1"
-REASON="$2"
-TIME="$(timestamp)"
-WG_IF="$WG_IF"
-WAN_IF="$WAN_IF"
-UPTIME="$(cut -d. -f1 /proc/uptime 2>/dev/null)"
-EOF_STATE
-    chmod 600 "$STATE"
+TAG=wg-guardian
+log(){ logger -t "$TAG" "$*"; }
+wan_up(){ ubus call "network.interface.$WAN_LOGICAL" status 2>/dev/null | grep -q '"up": true'; }
+clock_valid(){ now=$(date +%s 2>/dev/null); case "$now" in ''|*[!0-9]*) return 1;; esac; [ "$now" -ge "$NTP_VALID_EPOCH" ]; }
+ntp_synced(){
+  # OpenWrt sysntpd/BusyBox ntpd reports a successful sync in the system log.
+  # Reboot clears the in-memory log, so this cannot be satisfied by a prior boot.
+  clock_valid || return 1
+  logread 2>/dev/null | grep -Eiq 'ntpd.*(synchronized|sync(ed)? to)'
 }
-
-detect_wan() {
-    [ -n "$WAN_IF" ] && return 0
-    WAN_IF="$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)"
-    [ -n "$WAN_IF" ] || WAN_IF="$(ip route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')"
+wait_for_ntp(){
+  log 'Waiting for successful NTP synchronization before starting WireGuard.'
+  while :; do
+    if ntp_synced; then log "NTP synchronized; system time is $(date)."; return 0; fi
+    log 'NTP not synchronized yet; WireGuard remains down and WAN fallback remains available.'
+    sleep "$NTP_WAIT_INTERVAL"
+  done
 }
-
-route_is_wan() {
-    target="$1"
-    [ "$ENABLE_ROUTE" = "1" ] || return 0
-    route="$(ip route get "$target" 2>/dev/null)"
-    [ -n "$route" ] || return 1
-    echo "$route" | grep -q "dev $WG_IF" && return 1
-    if [ -n "$WAN_IF" ]; then
-        echo "$route" | grep -q "dev $WAN_IF" || return 1
+endpoint_host(){
+  # Obtain current endpoint from wg runtime. Output is host only; IPv6 literals are skipped.
+  ep=$(wg show "$WG_IF" endpoints 2>/dev/null | awk 'NR==1{print $2}')
+  [ -n "$ep" ] || return 1
+  case "$ep" in *:*) host=${ep%:*};; *) host=$ep;; esac
+  case "$host" in *[!A-Za-z0-9.-]*|'') return 1;; esac
+  printf '%s\n' "$host"
+}
+endpoint_resolves(){
+  h=$(endpoint_host) || return 1
+  case "$h" in *[!0-9.]* ) nslookup "$h" 2>/dev/null | grep -q 'Address' ;; *) return 0;; esac
+}
+latest_handshake(){ wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'BEGIN{m=0}{if($2>m)m=$2}END{print m+0}'; }
+handshake_fresh(){
+  now=$(date +%s 2>/dev/null); hs=$(latest_handshake)
+  [ "$hs" -gt 0 ] && [ $((now-hs)) -le "$HANDSHAKE_STALE" ]
+}
+wg_up(){ ubus call "network.interface.$WG_IF" status 2>/dev/null | grep -q '"up": true'; }
+set_wg_down(){
+  if wg_up; then
+    log 'VPN unavailable; taking WireGuard interface down to allow WAN default route.'
+    ifdown "$WG_IF" >/dev/null 2>&1 || ubus call "network.interface.$WG_IF" down >/dev/null 2>&1
+  fi
+}
+try_wg(){
+  log 'Attempting WireGuard recovery.'
+  ifup "$WG_IF" >/dev/null 2>&1 || ubus call "network.interface.$WG_IF" up >/dev/null 2>&1 || return 1
+  # Wait for handshake. No firewall config is edited.
+  waited=0
+  while [ "$waited" -lt 45 ]; do
+    sleep 3; waited=$((waited+3))
+    handshake_fresh && { log 'Fresh WireGuard handshake confirmed; VPN route restored.'; return 0; }
+  done
+  return 1
+}
+run_loop(){
+  delay=$RETRY_INITIAL
+  log "Guardian started: WG=$WG_IF WAN=$WAN_LOGICAL"
+  # Defensively keep WG down until this boot has an NTP synchronization.
+  if wg_up; then ifdown "$WG_IF" >/dev/null 2>&1 || true; fi
+  while :; do
+    if ! wan_up; then log 'WAN is down; waiting for WAN.'; sleep "$CHECK_INTERVAL"; continue; fi
+    if ! ntp_synced; then
+      wait_for_ntp
+      delay=$RETRY_INITIAL
     fi
-    return 0
-}
-
-wan_ok() {
-    detect_wan
-    [ -n "$WAN_IF" ] || return 1
-    # Bind the probe to the physical WAN device so a healthy VPN default route
-    # does not make the WAN test incorrectly fail.
-    ping -I "$WAN_IF" -c 1 -W 3 "$DNS_TEST_IP" >/dev/null 2>&1
-}
-
-set_failure_policy() {
-    # Firewall forwarding is configured by the installer. Routing falls back
-    # naturally when the WireGuard interface is brought down.
-    if [ "$VPN_FAILURE_POLICY" = 'blocked' ]; then
-        log 'Strict VPN kill-switch policy active: LAN-to-WAN forwarding is disabled.'
+    if wg_up && handshake_fresh; then delay=$RETRY_INITIAL; sleep "$CHECK_INTERVAL"; continue; fi
+    if wg_up; then log 'WireGuard has no recent handshake; checking endpoint.'; fi
+    if ! endpoint_resolves; then
+      log 'WireGuard endpoint DNS resolution failed; enabling WAN fallback.'
+      set_wg_down
     else
-        log 'Automatic WAN fallback policy active.'
+      if try_wg; then delay=$RETRY_INITIAL; sleep "$CHECK_INTERVAL"; continue; fi
+      log "WireGuard recovery attempt failed; WAN fallback remains active. Next retry in ${delay}s."
+      set_wg_down
     fi
+    sleep "$delay"
+    [ "$delay" -ge "$RETRY_MAX" ] || delay=$((delay*2))
+    [ "$delay" -le "$RETRY_MAX" ] || delay=$RETRY_MAX
+  done
 }
-
-dns_ok() {
-    [ "$ENABLE_DNS" = "1" ] || return 0
-    if command -v nslookup >/dev/null 2>&1; then
-        nslookup "$DNS_TEST_DOMAIN" >/dev/null 2>&1 && return 0
-    fi
-    return 1
+status(){
+  echo "WireGuard interface: $WG_IF"
+  echo "WAN logical interface: $WAN_LOGICAL"
+  echo "WAN device at install: $WAN_DEV"
+  echo "WAN up: $(wan_up && echo yes || echo no)"
+  echo "WG up: $(wg_up && echo yes || echo no)"
+  echo "Fresh handshake: $(handshake_fresh && echo yes || echo no)"
+  wg show "$WG_IF" 2>/dev/null
 }
-
-clock_ok() {
-    year="$(date +%Y)"
-    case "$year" in
-        20[2-9][0-9]|2[1-9][0-9][0-9]) return 0 ;;
-    esac
-    return 1
-}
-
-ntp_recover() {
-    [ "$ENABLE_NTP" = "1" ] || return 0
-    clock_ok && return 0
-    log 'Clock invalid. Restarting NTP.'
-    /etc/init.d/sysntpd restart >/dev/null 2>&1
-    elapsed=0
-    while [ "$elapsed" -lt "$NTP_TIMEOUT" ]; do
-        clock_ok && { log "NTP synchronized: $(date)"; return 0; }
-        sleep 2
-        elapsed=$((elapsed + 2))
-        if [ $((elapsed % 15)) -eq 0 ]; then
-            /etc/init.d/sysntpd restart >/dev/null 2>&1
-        fi
-    done
-    return 1
-}
-
-endpoint_ok() {
-    [ "$ENABLE_ENDPOINT" = "1" ] || return 0
-
-    # Read the configured endpoint host from the detected interface's peers.
-    endpoint_host=""
-    peer_sections="$(uci show network 2>/dev/null | sed -n "s/^network\.\([^.=]*\)=wireguard_${WG_IF}$/\1/p")"
-    for peer_section in $peer_sections; do
-        endpoint_host="$(uci -q get "network.$peer_section.endpoint_host" 2>/dev/null)"
-        [ -n "$endpoint_host" ] && break
-    done
-    [ -n "$endpoint_host" ] || { log 'No WireGuard peer endpoint_host found; endpoint check cannot pass.'; return 1; }
-
-    case "$endpoint_host" in
-        *[!0-9.]* )
-            command -v nslookup >/dev/null 2>&1 || return 1
-            nslookup "$endpoint_host" >/dev/null 2>&1 || return 1
-            endpoint_ip="$(nslookup "$endpoint_host" 2>/dev/null | awk '/^Address[[:space:]]*:/ {print $2}' | tail -n 1)"
-            ;;
-        * ) endpoint_ip="$endpoint_host" ;;
-    esac
-    [ -n "$endpoint_ip" ] || return 1
-    route="$(ip route get "$endpoint_ip" 2>/dev/null)"
-    [ -n "$route" ] || return 1
-    echo "$route" | grep -q "dev $WG_IF" && return 1
-    return 0
-}
-
-latest_handshake() {
-    wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'BEGIN{max=0} {if($2>max)max=$2} END{print max}'
-}
-
-handshake_ok() {
-    hs="$(latest_handshake)"
-    [ -n "$hs" ] && [ "$hs" != "0" ] || return 1
-    now="$(date +%s)"
-    age=$((now - hs))
-    [ "$age" -ge 0 ] 2>/dev/null || return 1
-    [ "$age" -le "$HANDSHAKE_TIMEOUT" ]
-}
-
-wait_handshake() {
-    elapsed=0
-    while [ "$elapsed" -lt "$HANDSHAKE_TIMEOUT" ]; do
-        handshake_ok && return 0
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-    return 1
-}
-
-start_wg() {
-    log "Starting WireGuard $WG_IF"
-    ifup "$WG_IF" >/dev/null 2>&1 || return 1
-    wait_handshake
-}
-
-stop_wg() { ifdown "$WG_IF" >/dev/null 2>&1; }
-
-telegram() {
-    [ "$ENABLE_TELEGRAM" = "1" ] || return 0
-    [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_CHAT" ] || return 0
-    message="$1"
-    if command -v curl >/dev/null 2>&1; then
-        curl -sS --max-time 10 -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" --data-urlencode "chat_id=${TELEGRAM_CHAT}" --data-urlencode "text=${message}" >/dev/null 2>&1
-        return 0
-    fi
-    if command -v wget >/dev/null 2>&1; then
-        wget -q -T 10 -O /dev/null --post-data="chat_id=${TELEGRAM_CHAT}&text=${message}" "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" >/dev/null 2>&1
-    fi
-}
-
-backup() {
-    [ "$ENABLE_BACKUP" = "1" ] || return 0
-    mkdir -p "$BACKUP_DIR"
-    file="$BACKUP_DIR/backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar -czf "$file" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf "$CONFIG" 2>/dev/null || return 1
-    chmod 600 "$file"
-    count=0
-    for f in $(ls -1t "$BACKUP_DIR"/*.tar.gz 2>/dev/null); do
-        count=$((count + 1))
-        if [ "$count" -gt "$BACKUP_RETENTION" ]; then rm -f "$f"; fi
-    done
-}
-
-boot() {
-    detect_wan
-    set_state 'BOOTING' 'Guardian starting'
-    log "Guardian boot sequence started: WG=$WG_IF WAN=$WAN_IF"
-    set_failure_policy
-
-    elapsed=0
-    while [ "$elapsed" -lt "$WAN_TIMEOUT" ]; do
-        if wan_ok; then log 'WAN Internet available'; break; fi
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-
-    if ! wan_ok; then
-        log 'WAN timeout'
-        set_state 'WAN_FAILED' 'WAN unavailable'
-        telegram 'OpenWrt Guardian: WAN unavailable.'
-        return 1
-    fi
-
-    if [ "$ENABLE_DNS" = "1" ] && ! dns_ok; then
-        log 'DNS health check failed'
-        telegram 'OpenWrt Guardian: DNS health check failed.'
-    fi
-
-    if ! ntp_recover; then
-        log 'NTP recovery failed'
-        set_state 'NTP_FAILED' 'NTP unavailable'
-        telegram 'OpenWrt Guardian: NTP synchronization failed.'
-        [ "$ENABLE_FALLBACK" = "1" ] && return 1
-    fi
-
-    if [ "$ENABLE_ENDPOINT" = "1" ]; then
-        if endpoint_ok; then log 'WireGuard endpoint route OK'; else log 'WireGuard endpoint route check failed'; fi
-    fi
-
-    attempt=1
-    while [ "$attempt" -le 3 ]; do
-        log "WireGuard attempt $attempt/3"
-        if start_wg; then
-            set_state 'RUNNING' 'WireGuard handshake OK'
-            log 'WireGuard UP'
-            telegram "OpenWrt Guardian: WireGuard UP on $WG_IF"
-            return 0
-        fi
-        stop_wg
-        [ "$ENABLE_RETRY" = "1" ] || break
-        case "$attempt" in 1) delay=5;; 2) delay=15;; *) delay=30;; esac
-        log "Retrying WireGuard in ${delay}s"
-        sleep "$delay"
-        attempt=$((attempt + 1))
-    done
-
-    set_state 'VPN_FAILED' 'WireGuard handshake failed'
-    log 'WireGuard startup failed; WAN remains available because WG is not auto-started.'
-    telegram "OpenWrt Guardian: WireGuard FAILED on $WG_IF"
-    [ "$ENABLE_FALLBACK" = "1" ] && log 'Safe WAN fallback active'
-    return 1
-}
-
-watchdog() {
-    log 'Watchdog started'
-    while :; do
-        sleep "$WATCHDOG_INTERVAL"
-        detect_wan
-
-        if ! wan_ok; then
-            set_state 'WAN_DOWN' 'WAN unavailable'
-            log 'WAN unavailable'
-            continue
-        fi
-
-        if ! clock_ok; then
-            log 'Clock invalid'
-            ntp_recover
-            continue
-        fi
-
-        if [ "$ENABLE_DNS" = "1" ] && ! dns_ok; then
-            log 'DNS health check failed'
-            telegram 'OpenWrt Guardian: DNS health check failed.'
-        fi
-
-        if handshake_ok; then
-            set_state 'RUNNING' 'WireGuard healthy'
-            continue
-        fi
-
-        log 'WireGuard handshake missing/stale; recovery started'
-        set_state 'RECOVERING' 'Handshake failed'
-        telegram 'OpenWrt Guardian: WireGuard handshake lost. Recovery started.'
-        ntp_recover
-        [ "$ENABLE_ENDPOINT" = "1" ] && endpoint_ok
-
-        attempt=1
-        recovered=0
-        while [ "$attempt" -le 3 ]; do
-            stop_wg
-            sleep 2
-            if start_wg; then
-                recovered=1
-                set_state 'RUNNING' 'WireGuard recovered'
-                log 'WireGuard recovered'
-                telegram 'OpenWrt Guardian: WireGuard recovered.'
-                break
-            fi
-            [ "$ENABLE_RETRY" = "1" ] || break
-            case "$attempt" in 1) delay=5;; 2) delay=15;; *) delay=30;; esac
-            sleep "$delay"
-            attempt=$((attempt + 1))
-        done
-
-        if [ "$recovered" != "1" ]; then
-            set_state 'VPN_FAILED' 'Recovery failed'
-            log "WireGuard recovery failed; policy=$VPN_FAILURE_POLICY"
-            telegram 'OpenWrt Guardian: WireGuard recovery FAILED.'
-            sleep 60
-        fi
-    done
-}
-
-status() {
-    detect_wan
-    echo
-    echo '========================================'
-    echo ' WireGuard Guardian Status'
-    echo '========================================'
-    echo
-    echo "WireGuard : $WG_IF"
-    echo "WAN       : $WAN_IF"
-    echo "Time      : $(date)"
-    echo
-    echo 'Configuration:'
-    echo "  Route detection : $ENABLE_ROUTE"
-    echo "  Endpoint check  : $ENABLE_ENDPOINT"
-    echo "  Retry/backoff   : $ENABLE_RETRY"
-    echo "  DNS check       : $ENABLE_DNS"
-    echo "  NTP recovery    : $ENABLE_NTP"
-    echo "  Safe fallback   : $ENABLE_FALLBACK"
-    echo "  Failure policy  : $VPN_FAILURE_POLICY"
-    echo "  IPv6 disabled   : $ENABLE_IPV6"
-    echo "  State tracking  : $ENABLE_STATE"
-    echo "  Telegram        : $ENABLE_TELEGRAM"
-    echo "  Backup          : $ENABLE_BACKUP"
-    echo
-    echo 'WAN:'
-    wan_ok && echo '  OK' || echo '  FAILED'
-    echo
-    echo 'DNS:'
-    dns_ok && echo '  OK' || echo '  FAILED'
-    echo
-    echo 'Clock:'
-    clock_ok && echo "  OK - $(date)" || echo '  INVALID'
-    echo
-    echo 'WireGuard:'
-    handshake_ok && echo '  HANDSHAKE OK' || echo '  HANDSHAKE FAILED/STALE'
-    echo
-    echo 'IPv6:'
-    [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = '1' ] && echo '  DISABLED' || echo '  ENABLED'
-    echo
-    echo 'State:'
-    [ -f "$STATE" ] && cat "$STATE" || echo '  No state recorded'
-    echo
-    wg show "$WG_IF" 2>/dev/null
-    echo
-}
-
-test_all() {
-    echo
-    echo '========================================'
-    echo ' WireGuard Guardian Diagnostic'
-    echo '========================================'
-    echo
-    detect_wan
-    echo "WireGuard interface: $WG_IF"
-    echo "WAN interface: $WAN_IF"
-    echo
-    echo 'Route to 1.1.1.1:'
-    ip route get 1.1.1.1 2>/dev/null
-    echo
-    echo 'WAN Internet:'
-    wan_ok && echo '  PASS' || echo '  FAIL'
-    echo
-    echo 'DNS:'
-    dns_ok && echo '  PASS' || echo '  FAIL'
-    echo
-    echo 'NTP:'
-    clock_ok && echo "  PASS - $(date)" || echo '  FAIL'
-    echo
-    echo 'Endpoint:'
-    endpoint_ok && echo '  PASS' || echo '  FAIL'
-    echo
-    echo 'WireGuard handshake:'
-    handshake_ok && echo '  PASS' || echo '  FAIL'
-    echo
-}
-
-restore() {
-    set -- "$BACKUP_DIR"/*.tar.gz
-    count=0
-    for archive in "$@"; do
-        [ -f "$archive" ] || continue
-        count=$((count + 1))
-        printf '  %s) %s\n' "$count" "${archive##*/}"
-    done
-    [ "$count" -gt 0 ] || { echo 'No backup available.'; return 1; }
-    while :; do
-        printf 'Select backup number (1-%s), or 0 to cancel: ' "$count"
-        IFS= read -r choice
-        [ "$choice" = '0' ] && return 0
-        case "$choice" in ''|*[!0-9]*) echo 'Enter a valid number.'; continue ;; esac
-        [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ] || { echo 'Number outside range.'; continue; }
-        idx=0; selected=''
-        for archive in "$BACKUP_DIR"/*.tar.gz; do
-            [ -f "$archive" ] || continue
-            idx=$((idx + 1))
-            [ "$idx" -eq "$choice" ] && { selected="$archive"; break; }
-        done
-        break
-    done
-    printf 'Restore %s? [y/N]: ' "${selected##*/}"
-    IFS= read -r confirm
-    case "$confirm" in y|Y|yes|YES|Yes) ;; *) echo 'Restore cancelled.'; return 0 ;; esac
-    members="$(tar -tzf "$selected" 2>/dev/null)" || { echo 'Invalid backup archive.'; return 1; }
-    for member in $members; do
-        case "$member" in
-            etc/config/network|etc/config/firewall|etc/config/dhcp|etc/config/system|etc/sysctl.conf|etc/wg-guardian/config|./etc/config/network|./etc/config/firewall|./etc/config/dhcp|./etc/config/system|./etc/sysctl.conf|./etc/wg-guardian/config) ;;
-            *) echo "Unexpected archive path: $member"; return 1 ;;
-        esac
-    done
-    mkdir -p "$BACKUP_DIR"
-    before="$BACKUP_DIR/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
-    tar -czf "$before" /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/sysctl.conf "$CONFIG" 2>/dev/null
-    [ -f "$before" ] && chmod 600 "$before"
-    tmp="$(mktemp -d /tmp/wg-guardian-restore.XXXXXX 2>/dev/null)" || return 1
-    tar -xzf "$selected" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; return 1; }
-    for rel in etc/config/network etc/config/firewall etc/config/dhcp etc/config/system etc/sysctl.conf etc/wg-guardian/config; do
-        if [ -f "$tmp/$rel" ]; then mkdir -p "/$(dirname "$rel")"; cp -p "$tmp/$rel" "/$rel" || { rm -rf "$tmp"; return 1; }; fi
-    done
-    rm -rf "$tmp"
-    echo 'Restore completed. Reboot the router to apply restored network settings.'
-    [ -f "$before" ] && echo "Pre-restore snapshot: $before"
-}
-
-case "$1" in
-    daemon) boot; watchdog ;;
-    status) status ;;
-    test) test_all ;;
-    backup) backup ;;
-    restore) restore ;;
-    stop) ifdown "$WG_IF" >/dev/null 2>&1 ;;
-    *)
-        echo 'Usage:'
-        echo "  $0 daemon"
-        echo "  $0 status"
-        echo "  $0 test"
-        echo "  $0 backup"
-        echo "  $0 restore"
-        echo "  $0 stop"
-        ;;
-esac
-EOF_RUNTIME
+case "${1:-daemon}" in daemon) run_loop;; status) status;; *) echo "Usage: $0 {daemon|status}"; exit 2;; esac
+EOF_RUN
 chmod 755 "$RUNTIME"
 
-# ------------------------------------------------------------
-# Create OpenWrt procd service
-# ------------------------------------------------------------
-cat > "$INIT" <<EOF_INIT
+cat > "$INIT" <<'EOF_INIT'
 #!/bin/sh /etc/rc.common
-
+# Start after network and sysntpd have been launched; daemon still waits for confirmed sync.
 START=99
 STOP=10
 USE_PROCD=1
 
 start_service() {
-    procd_open_instance guardian
-    procd_set_param command "$RUNTIME" daemon
-    procd_set_param respawn 3600 5 5
-    procd_close_instance
-}
-
-stop_service() {
-    "$RUNTIME" stop
+  procd_open_instance
+  procd_set_param command /usr/sbin/wg-guardian daemon
+  procd_set_param respawn 3600 5 5
+  procd_set_param stdout 1
+  procd_set_param stderr 1
+  procd_close_instance
 }
 EOF_INIT
 chmod 755 "$INIT"
 
-# ------------------------------------------------------------
-# Enable service
-# ------------------------------------------------------------
-"$INIT" enable
+# Ensure endpoint has a WAN route via the WAN default route. Do not alter firewall.
+/etc/init.d/network reload >/dev/null 2>&1 || true
+"$INIT" enable || fail 'Could not enable Guardian service.'
+"$INIT" start || fail 'Could not start Guardian service.'
 
-# ------------------------------------------------------------
-# Final backup
-# ------------------------------------------------------------
-if [ "$ENABLE_BACKUP" = "1" ]; then
-    "$RUNTIME" backup >/dev/null 2>&1
-fi
-
-# ------------------------------------------------------------
-# Final information
-# ------------------------------------------------------------
-echo
-echo '=============================================='
-printf ' %sInstallation Complete%s\n' "$GREEN" "$RESET"
-echo '=============================================='
-echo
-echo "WireGuard interface : $WG_IF"
-echo "WAN interface       : ${WAN_IF:-AUTO}"
-echo
-echo 'Installed files:'
-echo "  $RUNTIME"
-echo "  $INIT"
-echo "  $CONFIG"
-echo
-echo 'Useful commands:'
-echo "  $RUNTIME status"
-echo "  $RUNTIME test"
-echo "  $RUNTIME backup"
-echo "  $RUNTIME restore"
-echo "Standalone backups: $RECOVERY_DIR"
-echo
-echo 'Live logs:'
-echo "  logread -f -e $LOGTAG"
-echo
-if [ "$ENABLE_IPV6" = "1" ]; then
-    echo 'IPv6: DISABLED'
-else
-    echo 'IPv6: unchanged'
-fi
-echo
-echo 'Starting guardian...'
-echo
-"$INIT" start
-echo
-echo '=============================================='
-echo ' Guardian started.'
-echo '=============================================='
-echo
-echo 'Recommended: reboot once and watch:'
-echo
-echo "  logread -f -e $LOGTAG"
-echo
+say ''
+say 'WG Guardian installed.'
+say 'Firewall configuration was not modified.'
+say 'WireGuard auto-start is disabled; Guardian waits for NTP synchronization on every boot before starting it.'
+say "Backup: $BACKUP"
+say 'Commands:'
+say '  /usr/sbin/wg-guardian status'
+say '  /etc/init.d/wg-guardian restart'
+say '  logread -f -e wg-guardian'
+say ''
+say 'Boot sequence: WAN up -> confirmed NTP sync -> WireGuard start -> fresh handshake.'
+say 'If NTP is unavailable, WireGuard stays down and Guardian keeps waiting while WAN remains available.'
+say 'IMPORTANT: This service relies on your existing OpenWrt VPN firewall zone and LAN forwarding.'
+say 'It does not create or modify firewall zones, LAN forwarding, AllowedIPs, or default routes.'
+say 'Verify full-tunnel routing and WAN fallback before relying on it.'
